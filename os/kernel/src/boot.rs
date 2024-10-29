@@ -52,9 +52,8 @@ use crate::device::pit::Timer;
 use crate::device::ps2::Keyboard;
 use crate::device::qemu_cfg;
 use crate::device::serial::SerialPort;
-use crate::memory::{MemorySpace, nvmem, nvram_allocator};
+use crate::memory::{create_persistent_pool, MemorySpace, nvmem, nvram_allocator};
 use crate::memory::nvmem::Nfit;
-use crate::memory::nvmem::ALLOCATOR;
 use crate::memory::nvram_allocator::{NvramAllocator, qemu_exit};
 use crate::network::rtl8139;
 
@@ -251,11 +250,13 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             */
 
             //test merge after deallocate
+
+            /*
             let layout = Layout::from_size_align(4, 8).unwrap();
             let mut pointers = Vec::new();
 
             for i in 1..=5 {
-                let nvram_ptr = nvmem::allocate_nvram(layout);
+                let nvram_ptr = nvmem::ALLOCATOR.allocate(layout);
 
                 if let Ok(nvram_ptr) = nvram_ptr {
                     let nvram = nvram_ptr.as_ptr() as *mut u64;
@@ -272,10 +273,11 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             // Später kannst du den Speicher manuell freigeben:
 
             unsafe {
-                nvmem::deallocate_nvram(NonNull::new(pointers[1].as_ptr() as *mut u8).unwrap(), layout);
-                nvmem::deallocate_nvram(NonNull::new(pointers[0].as_ptr() as *mut u8).unwrap(), layout);
+                //nvmem::deallocate_nvram(NonNull::new(pointers[1].as_ptr() as *mut u8).unwrap(), layout);
+                nvmem::deallocate_nvram(NonNull::new(pointers[4].as_ptr() as *mut u8).unwrap(), layout);
             }
 
+            qemu_exit(0);
             let last_ptr = nvmem::allocate_nvram(layout);
             if let Ok(last_ptr) = last_ptr {
                 let last = last_ptr.as_ptr() as *mut u64;
@@ -284,7 +286,12 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
                 }
             } else {
                 println!("Fehler bei der Allokation für last");
-            }
+            }*/
+
+            //with global_perstistent_allocator now
+
+            create_persistent_pool("test", 4);
+
 
 
             //Get current time
