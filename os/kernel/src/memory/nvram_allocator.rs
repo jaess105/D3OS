@@ -1,4 +1,5 @@
-use super::global_persistent_allocator::{ALLOCATOR_MAGIC, GlobalPersistentAllocator};
+use log::info;
+use super::global_persistent_allocator::{GlobalPersistentAllocator};
 use crate::memory::nvmem::Locked;
 use x86_64::instructions::port::Port;
 use x86_64::structures::paging::frame::PhysFrameRange;
@@ -21,22 +22,9 @@ impl NvramAllocator {
             let size = (range.end.start_address().as_u64() - base_address) as usize;
 
             *allocator = Some(GlobalPersistentAllocator::new(base_address, size));
-        }
-    }
-
-    pub fn create_pool(&self, name: impl AsRef<[u8]>, size: usize) -> Option<u64> {
-        if let Some(allocator) = &mut *self.global_allocator.lock() {
-            allocator.allocate_pool(name.as_ref(), size)
         } else {
-            None
-        }
-    }
-
-    pub fn find_pool(&self, name: impl AsRef<[u8]>) -> Option<(u64, usize)> {
-        if let Some(allocator) = &*self.global_allocator.lock() {
-            allocator.find_pool(name.as_ref())
-        } else {
-            None
+            //TODO: Journaling and recovery
+            info!("NVRAM allocator already initialized");
         }
     }
 }

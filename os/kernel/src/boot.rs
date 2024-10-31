@@ -7,64 +7,72 @@
    ║ Author: Fabian Ruhland, HHU                                             ║
    ╚═════════════════════════════════════════════════════════════════════════╝
 */
-use alloc::boxed::Box;
+use crate::device::pit::Timer;
+use crate::device::ps2::Keyboard;
+use crate::device::qemu_cfg;
+use crate::device::serial::SerialPort;
 use crate::interrupt::interrupt_dispatcher;
+use crate::memory::global_persistent_allocator::GlobalPersistentAllocator;
+use crate::memory::nvmem::Nfit;
+use crate::memory::nvram_allocator::{NvramAllocator, qemu_exit};
+use crate::memory::{MemorySpace, nvmem, nvram_allocator};
 use crate::naming;
-use crate::syscall::syscall_dispatcher;
+use crate::network::rtl8139;
 use crate::process::thread::Thread;
+use crate::syscall::syscall_dispatcher;
+use crate::{
+    acpi_tables, allocator, apic, built_info, efi_system_table, gdt, init_acpi_tables, init_apic,
+    init_efi_system_table, init_initrd, init_pci, init_serial_port, init_terminal, initrd,
+    keyboard, logger, memory, network, process_manager, scheduler, serial_port, terminal, timer,
+    tss,
+};
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use chrono::DateTime;
 use core::alloc::{Allocator, Layout};
 use core::ffi::c_void;
 use core::mem::size_of;
 use core::ops::Deref;
 use core::ptr;
 use core::ptr::NonNull;
-use chrono::DateTime;
-use log::{debug, error, info, LevelFilter};
-use multiboot2::{BootInformation, BootInformationHeader, EFIMemoryMapTag, MemoryAreaType, MemoryMapTag, TagHeader};
+use log::{LevelFilter, debug, error, info};
+use multiboot2::{
+    BootInformation, BootInformationHeader, EFIMemoryMapTag, MemoryAreaType, MemoryMapTag,
+    TagHeader,
+};
 use smoltcp::iface;
 use smoltcp::iface::Interface;
 use smoltcp::time::Instant;
-use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address};
 use smoltcp::wire::IpAddress::Ipv4;
+use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address};
 use uefi::allocator;
 use uefi::mem::memory_map::MemoryMap;
 use uefi::prelude::*;
-use uefi::table::boot::PAGE_SIZE;
 use uefi::table::Runtime;
+use uefi::table::boot::PAGE_SIZE;
 use uefi::table::runtime::Time;
 use uefi_raw::table::boot::MemoryType;
+use x86_64::PrivilegeLevel::Ring0;
 use x86_64::instructions::interrupts;
-use x86_64::instructions::segmentation::{Segment, CS, DS, ES, FS, GS, SS};
+use x86_64::instructions::segmentation::{CS, DS, ES, FS, GS, SS, Segment};
 use x86_64::instructions::tables::load_tss;
-use x86_64::{PhysAddr, VirtAddr};
 use x86_64::registers::segmentation::SegmentSelector;
 use x86_64::structures::gdt::Descriptor;
-use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame};
-use x86_64::PrivilegeLevel::Ring0;
 use x86_64::structures::paging::frame::PhysFrameRange;
 use x86_64::structures::paging::page::PageRange;
-use crate::{acpi_tables, allocator, apic, built_info, efi_system_table, gdt, init_acpi_tables, init_apic, init_efi_system_table, init_initrd, init_pci, init_serial_port, init_terminal, initrd, keyboard, logger, memory, network, process_manager, scheduler, serial_port, terminal, timer, tss};
-use crate::device::pit::Timer;
-use crate::device::ps2::Keyboard;
-use crate::device::qemu_cfg;
-use crate::device::serial::SerialPort;
-use crate::memory::{create_persistent_pool, MemorySpace, nvmem, nvram_allocator};
-use crate::memory::nvmem::Nfit;
-use crate::memory::nvram_allocator::{NvramAllocator, qemu_exit};
-use crate::network::rtl8139;
-
+use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame};
+use x86_64::{PhysAddr, VirtAddr};
 
 // import labels from linker script 'link.ld'
 unsafe extern "C" {
     static ___KERNEL_DATA_START__: u64; // start address of OS image
-    static ___KERNEL_DATA_END__: u64;   // end address of OS image
+    static ___KERNEL_DATA_END__: u64; // end address of OS image
 }
 
-const INIT_HEAP_PAGES: usize = 0x4000;   // number of heap pages for booting the OS
+const INIT_HEAP_PAGES: usize = 0x4000; // number of heap pages for booting the OS
 
 /// Description: First rust function called from assembly code `boot.asm` \
 ///
@@ -74,7 +82,9 @@ const INIT_HEAP_PAGES: usize = 0x4000;   // number of heap pages for booting the
 #[unsafe(no_mangle)]
 pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInformationHeader) {
     // Initialize logger
-    log::set_logger(logger()).map(|()| log::set_max_level(LevelFilter::Debug)).expect("Failed to initialize logger!");
+    log::set_logger(logger())
+        .map(|()| log::set_max_level(LevelFilter::Debug))
+        .expect("Failed to initialize logger!");
 
     // Log messages and panics are now working, but cannot use format string until the heap is initialized later on
     info!("Welcome to D3OS early boot environment!");
@@ -93,13 +103,21 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
     init_gdt();
 
     // The bootloader marks the kernel image region as available, so we need to reserve it manually
-    unsafe { memory::physical::reserve(kernel_image_region()); }
+    unsafe {
+        memory::physical::reserve(kernel_image_region());
+    }
 
     // and initialize kernel heap, after which formatted strings may be used in logs and panics.
     info!("Initializing kernel heap");
     let heap_region = memory::physical::alloc(INIT_HEAP_PAGES);
-    unsafe { allocator().init(&heap_region); }
-    debug!("Kernel heap is initialized [0x{:x} - 0x{:x}]", heap_region.start.start_address().as_u64(), heap_region.end.start_address().as_u64());
+    unsafe {
+        allocator().init(&heap_region);
+    }
+    debug!(
+        "Kernel heap is initialized [0x{:x} - 0x{:x}]",
+        heap_region.start.start_address().as_u64(),
+        heap_region.end.start_address().as_u64()
+    );
     debug!("Page frame allocator:\n{}", memory::physical::dump());
 
     // Initialize virtual memory management
@@ -114,20 +132,44 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
     }
 
     // Map the framebuffer, needed for text output of the terminal
-    let fb_info = multiboot.framebuffer_tag()
+    let fb_info = multiboot
+        .framebuffer_tag()
         .expect("No framebuffer information provided by bootloader!")
         .expect("Unknown framebuffer type!");
-    let fb_start_page = Page::from_start_address(VirtAddr::new(fb_info.address())).expect("Framebuffer address is not page aligned");
-    let fb_end_page = Page::from_start_address(VirtAddr::new(fb_info.address() + (fb_info.height() * fb_info.pitch()) as u64).align_up(PAGE_SIZE as u64)).unwrap();
-    kernel_process.address_space().map(PageRange { start: fb_start_page, end: fb_end_page }, MemorySpace::Kernel, PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE);
+    let fb_start_page = Page::from_start_address(VirtAddr::new(fb_info.address()))
+        .expect("Framebuffer address is not page aligned");
+    let fb_end_page = Page::from_start_address(
+        VirtAddr::new(fb_info.address() + (fb_info.height() * fb_info.pitch()) as u64)
+            .align_up(PAGE_SIZE as u64),
+    )
+    .unwrap();
+    kernel_process.address_space().map(
+        PageRange {
+            start: fb_start_page,
+            end: fb_end_page,
+        },
+        MemorySpace::Kernel,
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE,
+    );
 
     // Initialize terminal and enable terminal logging
-    init_terminal(fb_info.address() as *mut u8, fb_info.pitch(), fb_info.width(), fb_info.height(), fb_info.bpp());
+    init_terminal(
+        fb_info.address() as *mut u8,
+        fb_info.pitch(),
+        fb_info.width(),
+        fb_info.height(),
+        fb_info.bpp(),
+    );
     logger().register(terminal());
 
     // Dumping basic infos
     info!("Welcome to D3OS!");
-    let version = format!("v{} ({} - O{})", built_info::PKG_VERSION, built_info::PROFILE, built_info::OPT_LEVEL);
+    let version = format!(
+        "v{} ({} - O{})",
+        built_info::PKG_VERSION,
+        built_info::PROFILE,
+        built_info::OPT_LEVEL
+    );
     let git_ref = built_info::GIT_HEAD_REF.unwrap_or("Unknown");
     let git_commit = built_info::GIT_COMMIT_HASH_SHORT.unwrap_or("Unknown");
     let build_date = match DateTime::parse_from_rfc2822(built_info::BUILT_TIME_UTC) {
@@ -135,11 +177,21 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
         Err(_) => "Unknown".to_string(),
     };
     let bootloader_name = match multiboot.boot_loader_name_tag() {
-        Some(tag) => if tag.name().is_ok() { tag.name().unwrap_or("Unknown") } else { "Unknown" },
+        Some(tag) => {
+            if tag.name().is_ok() {
+                tag.name().unwrap_or("Unknown")
+            } else {
+                "Unknown"
+            }
+        }
         None => "Unknown",
     };
     info!("OS Version: [{}]", version);
-    info!("Git Version: [{} - {}]", built_info::GIT_HEAD_REF.unwrap_or_else(|| "Unknown"), git_commit);
+    info!(
+        "Git Version: [{} - {}]",
+        built_info::GIT_HEAD_REF.unwrap_or_else(|| "Unknown"),
+        git_commit
+    );
     info!("Build Date: [{}]", build_date);
     info!("Compiler: [{}]", built_info::RUSTC_VERSION);
     info!("Bootloader: [{}]", bootloader_name);
@@ -176,7 +228,8 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
     if efi_system_table().is_none() {
         if let Some(sdt_tag) = multiboot.efi_sdt64_tag() {
             info!("Initializing EFI runtime services");
-            let system_table = unsafe { SystemTable::<Runtime>::from_ptr(sdt_tag.sdt_address() as *mut c_void) };
+            let system_table =
+                unsafe { SystemTable::<Runtime>::from_ptr(sdt_tag.sdt_address() as *mut c_void) };
             if system_table.is_some() {
                 init_efi_system_table(system_table.unwrap());
             } else {
@@ -188,7 +241,11 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
     // Dump information about EFI runtime service (if available)
     if let Some(efi_system_table) = efi_system_table() {
         let system_table = efi_system_table.read();
-        info!("EFI runtime services available (Vendor: [{}], UEFI version: [{}])", system_table.firmware_vendor(), system_table.uefi_revision());
+        info!(
+            "EFI runtime services available (Vendor: [{}], UEFI version: [{}])",
+            system_table.firmware_vendor(),
+            system_table.uefi_revision()
+        );
     }
 
     // Initialize keyboard
@@ -209,7 +266,12 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
 
     // Set up network interface for emulated QEMU network (IP: 10.0.2.15, Gateway: 10.0.2.2)
     if qemu_cfg::is_available() {
-        let device = unsafe { ptr::from_ref(rtl8139().unwrap()).cast_mut().as_mut().unwrap() };
+        let device = unsafe {
+            ptr::from_ref(rtl8139().unwrap())
+                .cast_mut()
+                .as_mut()
+                .unwrap()
+        };
         let time = timer.systime_ms();
 
         let mut conf = iface::Config::new(HardwareAddress::from(device.read_mac_address()));
@@ -217,16 +279,19 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
 
         let mut interface = Interface::new(conf, device, Instant::from_millis(time as i64));
         interface.update_ip_addrs(|ips| {
-            ips.push(IpCidr::new(Ipv4(Ipv4Address::new(10, 0, 2, 15)), 24)).expect("Failed to add IP address");
+            ips.push(IpCidr::new(Ipv4(Ipv4Address::new(10, 0, 2, 15)), 24))
+                .expect("Failed to add IP address");
         });
-        interface.routes_mut().add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2)).expect("Failed to add default route");
+        interface
+            .routes_mut()
+            .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2))
+            .expect("Failed to add default route");
 
         network::add_interface(interface);
     }
 
     // Initialize non-volatile memory (creates identity mappings for any non-volatile memory regions)
     nvmem::init();
-
 
     // As a demo for NVRAM support, we read the last boot time from NVRAM and write the current boot time to it
     if let Ok(nfit) = acpi_tables().lock().find_table::<Nfit>() {
@@ -236,9 +301,59 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             // Read last boot time from NVRAM
             let date = unsafe { date_ptr.read() };
             if date.is_valid().is_ok() {
-                info!("Last boot time: [{:0>4}-{:0>2}-{:0>2} {:0>2}:{:0>2}:{:0>2}]", date.year(), date.month(), date.day(), date.hour(), date.minute(), date.second());
+                info!(
+                    "Last boot time: [{:0>4}-{:0>2}-{:0>2} {:0>2}:{:0>2}:{:0>2}]",
+                    date.year(),
+                    date.month(),
+                    date.day(),
+                    date.hour(),
+                    date.minute(),
+                    date.second()
+                );
             }
 
+            // use now the new global allocator etc.
+
+            let nvram_base = range.as_phys_frame_range().start.start_address().as_u64();
+            let nvram_size = (range.as_phys_frame_range().end - range.as_phys_frame_range().start)
+                as usize
+                * PAGE_SIZE;
+
+            // Initialize global persistent allocator
+            let mut global_allocator = GlobalPersistentAllocator::new(nvram_base, nvram_size);
+
+
+            // Create or recover a pool named "simon"
+            if let Some(pool) = global_allocator.get_or_create_pool(b"simon") {
+                // Use pool with transactions
+
+                info!("Komme ich bis hier ?");
+
+                match pool.transaction(|tx| {
+                    // Allocate some persistent memory
+                    let layout = Layout::from_size_align(1024, 8).unwrap();
+                    let memory = tx.allocate(layout)?;
+
+                    // Modify the allocated memory
+                    tx.modify(memory.cast::<[u8; 1024]>(), |data| {
+                        // Store some test data
+                        data[0] = 42;
+                        data[1] = 43;
+                        // Store current boot count
+                        let boot_count = data[2].wrapping_add(1);
+                        data[2] = boot_count;
+
+                        info!("Boot count: {}", boot_count);
+                    })?;
+
+                    Ok(memory)
+                }) {
+                    Ok(_) => info!("Successfully performed persistent memory transaction"),
+                    Err(e) => error!("Failed to perform persistent memory transaction: {:?}", e),
+                }
+            } else {
+                error!("Failed to create or recover persistent pool");
+            }
             // Allocate three distinct blocks in NVRAM
 
             /*
@@ -288,12 +403,6 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
                 println!("Fehler bei der Allokation für last");
             }*/
 
-            //with global_perstistent_allocator now
-
-            create_persistent_pool("test", 4);
-
-
-
             //Get current time
             // if let Some(efi_system_table) = efi_system_table() {
             //     let system_table = efi_system_table.read();
@@ -311,7 +420,8 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
     naming::api::init();
 
     // Load initial ramdisk
-    let initrd_tag = multiboot.module_tags()
+    let initrd_tag = multiboot
+        .module_tags()
         .find(|module| module.cmdline().is_ok_and(|name| name == "initrd"))
         .expect("Initrd not found!");
     init_initrd(initrd_tag);
@@ -326,17 +436,33 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
     }));
 
     // Create and register the 'shell' thread (from app image in ramdisk) in the scheduler
-    scheduler().ready(Thread::load_application(initrd().entries()
-                                                   .find(|entry| entry.filename().as_str().unwrap() == "shell")
-                                                   .expect("Shell application not available!")
-                                                   .data(), "shell", &Vec::new()));
+    scheduler().ready(Thread::load_application(
+        initrd()
+            .entries()
+            .find(|entry| entry.filename().as_str().unwrap() == "shell")
+            .expect("Shell application not available!")
+            .data(),
+        "shell",
+        &Vec::new(),
+    ));
 
     // Disable terminal logging (remove terminal output stream)
     logger().remove(terminal().as_ref());
     terminal().clear();
 
-    println!(include_str!("banner.txt"), version, git_ref.rsplit("/").next().unwrap_or(git_ref), git_commit, build_date,
-             built_info::RUSTC_VERSION.split_once("(").unwrap_or((built_info::RUSTC_VERSION, "")).0.trim(), bootloader_name);
+    println!(
+        include_str!("banner.txt"),
+        version,
+        git_ref.rsplit("/").next().unwrap_or(git_ref),
+        git_commit,
+        build_date,
+        built_info::RUSTC_VERSION
+            .split_once("(")
+            .unwrap_or((built_info::RUSTC_VERSION, ""))
+            .0
+            .trim(),
+        bootloader_name
+    );
 
     // Start APIC timer & scheduler
     info!("Starting scheduler");
@@ -386,13 +512,18 @@ fn kernel_image_region() -> PhysFrameRange {
     let end: PhysFrame;
 
     unsafe {
-        start = PhysFrame::from_start_address(PhysAddr::new(ptr::from_ref(&___KERNEL_DATA_START__) as u64)).expect("Kernel code is not page aligned");
-        end = PhysFrame::from_start_address(PhysAddr::new(ptr::from_ref(&___KERNEL_DATA_END__) as u64).align_up(PAGE_SIZE as u64)).unwrap();
+        start = PhysFrame::from_start_address(PhysAddr::new(
+            ptr::from_ref(&___KERNEL_DATA_START__) as u64,
+        ))
+        .expect("Kernel code is not page aligned");
+        end = PhysFrame::from_start_address(
+            PhysAddr::new(ptr::from_ref(&___KERNEL_DATA_END__) as u64).align_up(PAGE_SIZE as u64),
+        )
+        .unwrap();
     }
 
     return PhysFrameRange { start, end };
 }
-
 
 /// Description: Search memory map, provided by bootloader of EFI, for usable memory and initialize physical memory management \
 ///
@@ -400,27 +531,38 @@ fn kernel_image_region() -> PhysFrameRange {
 ///    `multiboot2_addr` address of multiboot2 info records
 ///
 /// Return: `BootInformation`
-fn multiboot2_search_memory_map(multiboot2_addr: *const BootInformationHeader) -> BootInformation<'static> {
-    let multiboot = unsafe { BootInformation::load(multiboot2_addr).expect("Failed to get Multiboot2 information") };
+fn multiboot2_search_memory_map(
+    multiboot2_addr: *const BootInformationHeader,
+) -> BootInformation<'static> {
+    let multiboot = unsafe {
+        BootInformation::load(multiboot2_addr).expect("Failed to get Multiboot2 information")
+    };
 
     // Search memory map, provided by bootloader of EFI, for usable memory and initialize physical memory management
     if let Some(_) = multiboot.efi_bs_not_exited_tag() {
         // EFI boot services have not been exited, and we obtain access to the memory map and EFI runtime services by exiting them manually
         info!("EFI boot services have not been exited");
-        let image_tag = multiboot.efi_ih64_tag().expect("EFI image handle not available!");
-        let sdt_tag = multiboot.efi_sdt64_tag().expect("EFI system table not available!");
+        let image_tag = multiboot
+            .efi_ih64_tag()
+            .expect("EFI image handle not available!");
+        let sdt_tag = multiboot
+            .efi_sdt64_tag()
+            .expect("EFI system table not available!");
         let image_handle;
         let system_table;
 
         unsafe {
-            image_handle = Handle::from_ptr(image_tag.image_handle() as *mut c_void).expect("Failed to create EFI image handle struct from pointer!");
-            system_table = SystemTable::<Boot>::from_ptr(sdt_tag.sdt_address() as *mut c_void).expect("Failed to create EFI system table struct from pointer!");
+            image_handle = Handle::from_ptr(image_tag.image_handle() as *mut c_void)
+                .expect("Failed to create EFI image handle struct from pointer!");
+            system_table = SystemTable::<Boot>::from_ptr(sdt_tag.sdt_address() as *mut c_void)
+                .expect("Failed to create EFI system table struct from pointer!");
             system_table.boot_services().set_image_handle(image_handle);
         }
 
         info!("Exiting EFI boot services to obtain runtime system table and memory map");
         unsafe {
-            let (runtime_table, memory_map) = system_table.exit_boot_services(MemoryType::LOADER_DATA);
+            let (runtime_table, memory_map) =
+                system_table.exit_boot_services(MemoryType::LOADER_DATA);
             scan_efi_memory_map(&memory_map);
             init_efi_system_table(runtime_table);
         }
@@ -446,42 +588,74 @@ fn multiboot2_search_memory_map(multiboot2_addr: *const BootInformationHeader) -
 ///              and bootloader provides these memory maps.
 fn scan_multiboot2_memory_map(memory_map: &MemoryMapTag) {
     info!("Searching memory map for available regions");
-    memory_map.memory_areas().iter()
+    memory_map
+        .memory_areas()
+        .iter()
         .filter(|area| area.typ() == MemoryAreaType::Available)
-        .for_each(|area| {
-            unsafe {
-                memory::physical::insert(PhysFrameRange {
-                    start: PhysFrame::from_start_address(PhysAddr::new(area.start_address()).align_up(PAGE_SIZE as u64)).unwrap(),
-                    end: PhysFrame::from_start_address(PhysAddr::new(area.end_address()).align_down(PAGE_SIZE as u64)).unwrap()
-                });
-            }
+        .for_each(|area| unsafe {
+            memory::physical::insert(PhysFrameRange {
+                start: PhysFrame::from_start_address(
+                    PhysAddr::new(area.start_address()).align_up(PAGE_SIZE as u64),
+                )
+                .unwrap(),
+                end: PhysFrame::from_start_address(
+                    PhysAddr::new(area.end_address()).align_down(PAGE_SIZE as u64),
+                )
+                .unwrap(),
+            });
         });
 }
-
 
 /// Description: Memory map from efi. Only available if boot services have been exited.
 ///              Sometimes bootloaders do not provide multiboot2 memory maps if
 ///              efi information has been requested.
 fn scan_efi_multiboot2_memory_map(memory_map: &EFIMemoryMapTag) {
     info!("Searching memory map for available regions");
-    memory_map.memory_areas()
-        .filter(|area| area.ty.0 == MemoryType::CONVENTIONAL.0 || area.ty.0 == MemoryType::LOADER_CODE.0 || area.ty.0 == MemoryType::LOADER_DATA.0
-            || area.ty.0 == MemoryType::BOOT_SERVICES_CODE.0 || area.ty.0 == MemoryType::BOOT_SERVICES_DATA.0) // .0 necessary because of different version dependencies to uefi-crate
+    memory_map
+        .memory_areas()
+        .filter(|area| {
+            area.ty.0 == MemoryType::CONVENTIONAL.0
+                || area.ty.0 == MemoryType::LOADER_CODE.0
+                || area.ty.0 == MemoryType::LOADER_DATA.0
+                || area.ty.0 == MemoryType::BOOT_SERVICES_CODE.0
+                || area.ty.0 == MemoryType::BOOT_SERVICES_DATA.0
+        }) // .0 necessary because of different version dependencies to uefi-crate
         .for_each(|area| {
-            let start = PhysFrame::from_start_address(PhysAddr::new(area.phys_start).align_up(PAGE_SIZE as u64)).unwrap();
-            unsafe { memory::physical::insert(PhysFrameRange { start, end: start + area.page_count }); }
+            let start = PhysFrame::from_start_address(
+                PhysAddr::new(area.phys_start).align_up(PAGE_SIZE as u64),
+            )
+            .unwrap();
+            unsafe {
+                memory::physical::insert(PhysFrameRange {
+                    start,
+                    end: start + area.page_count,
+                });
+            }
         });
 }
-
 
 /// Description: Memory map from efi. Only available if boot services have NOT been exited.
 fn scan_efi_memory_map(memory_map: &dyn MemoryMap) {
     info!("Searching memory map for available regions");
-    memory_map.entries()
-        .filter(|area| area.ty == MemoryType::CONVENTIONAL || area.ty == MemoryType::LOADER_CODE || area.ty == MemoryType::LOADER_DATA
-            || area.ty == MemoryType::BOOT_SERVICES_CODE || area.ty == MemoryType::BOOT_SERVICES_DATA)
+    memory_map
+        .entries()
+        .filter(|area| {
+            area.ty == MemoryType::CONVENTIONAL
+                || area.ty == MemoryType::LOADER_CODE
+                || area.ty == MemoryType::LOADER_DATA
+                || area.ty == MemoryType::BOOT_SERVICES_CODE
+                || area.ty == MemoryType::BOOT_SERVICES_DATA
+        })
         .for_each(|area| {
-            let start = PhysFrame::from_start_address(PhysAddr::new(area.phys_start).align_up(PAGE_SIZE as u64)).unwrap();
-            unsafe { memory::physical::insert(PhysFrameRange { start, end: start + area.page_count }); }
+            let start = PhysFrame::from_start_address(
+                PhysAddr::new(area.phys_start).align_up(PAGE_SIZE as u64),
+            )
+            .unwrap();
+            unsafe {
+                memory::physical::insert(PhysFrameRange {
+                    start,
+                    end: start + area.page_count,
+                });
+            }
         });
 }

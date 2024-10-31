@@ -278,27 +278,3 @@ impl<A> Locked<A> {
 pub fn align_up(addr: usize, align: usize) -> usize {
     (addr + align - 1) & !(align - 1)
 }
-
-// pub fn allocate_nvram(layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-//     ALLOCATOR.allocate(layout)
-// }
-//
-// pub unsafe fn deallocate_nvram(ptr: NonNull<u8>, layout: Layout) {
-//     ALLOCATOR.deallocate(ptr, layout)
-// }
-
-// pub fn allocate_nvram_zeroed(layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-//     let result = allocate_nvram(layout)?;
-//     unsafe {
-//         ptr::write_bytes(result.as_ptr() as *mut u8, 0, layout.size());
-//     }
-//     Ok(result)
-// }
-
-pub fn create_persistent_pool(name: impl AsRef<[u8]>, size: usize) -> Option<u64> {
-    ALLOCATOR.create_pool(name, size)
-}
-
-pub fn get_persistent_pool(name: impl AsRef<[u8]>) -> Option<(u64, usize)> {
-    ALLOCATOR.find_pool(name)
-}

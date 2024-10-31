@@ -5,6 +5,8 @@ pub mod nvram_allocator;
 pub mod physical;
 pub mod r#virtual;
 
+pub mod pool;
+
 #[derive(Clone, Copy)]
 pub enum MemorySpace {
     Kernel,
@@ -13,4 +15,3 @@ pub enum MemorySpace {
 
 pub const PAGE_SIZE: usize = 0x1000;
 
-pub use nvmem::{create_persistent_pool, get_persistent_pool};
