@@ -16,7 +16,7 @@ use crate::memory::global_persistent_allocator::GlobalPersistentAllocator;
 use crate::memory::nvmem::Nfit;
 use crate::memory::nvram_allocator::{NvramAllocator, qemu_exit};
 use crate::memory::{MemorySpace, nvmem, nvram_allocator};
-use crate::naming;
+use crate::{init_persistent_allocator, naming};
 use crate::network::rtl8139;
 use crate::process::thread::Thread;
 use crate::syscall::syscall_dispatcher;
@@ -300,25 +300,29 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             let date_ptr = range.as_phys_frame_range().start.start_address().as_u64() as *mut Time;
 
             // Read last boot time from NVRAM
-            let date = unsafe { date_ptr.read() };
-            if date.is_valid().is_ok() {
-                info!(
-                    "Last boot time: [{:0>4}-{:0>2}-{:0>2} {:0>2}:{:0>2}:{:0>2}]",
-                    date.year(),
-                    date.month(),
-                    date.day(),
-                    date.hour(),
-                    date.minute(),
-                    date.second()
-                );
-            }
+            // let date = unsafe { date_ptr.read() };
+            // if date.is_valid().is_ok() {
+            //     info!(
+            //         "Last boot time: [{:0>4}-{:0>2}-{:0>2} {:0>2}:{:0>2}:{:0>2}]",
+            //         date.year(),
+            //         date.month(),
+            //         date.day(),
+            //         date.hour(),
+            //         date.minute(),
+            //         date.second()
+            //     );
+            // }
 
-            // use now the new global allocator etc.
-
+            // init persistent allocator
             let nvram_base = range.as_phys_frame_range().start.start_address().as_u64();
             let nvram_size = (range.as_phys_frame_range().end - range.as_phys_frame_range().start)
-                as usize
-                * PAGE_SIZE;
+                as usize * PAGE_SIZE;
+
+            let allocator = GlobalPersistentAllocator::new(nvram_base, nvram_size);
+            info!("About to store allocator in global storage");
+            init_persistent_allocator(allocator);
+
+
 
             // //mesure time
             // let start_time = timer.systime_ms();

@@ -36,7 +36,8 @@ pub enum SystemCall {
     GetDate,
     SetDate,
     MkDir,
-
+    CreatePersistentPool,
+    ReleasePersistentPool,
     // no syscall, just marking last number, see NUM_SYSCALLS
     // insert any new system calls before this marker
     LastEntryMarker,
@@ -83,3 +84,5 @@ pub fn syscall(call: SystemCall, args: &[usize]) -> SyscallResult {
 
     convert_ret_code_to_syscall_result(ret_code.try_into().unwrap())
 }
+
+

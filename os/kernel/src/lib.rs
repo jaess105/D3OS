@@ -34,7 +34,7 @@ use crate::process::scheduler::Scheduler;
 use crate::process::thread::Thread;
 use core::fmt::Arguments;
 use core::panic::PanicInfo;
-use ::log::{error, Level, Log, Record};
+use ::log::{error, info, Level, Log, Record};
 use acpi::AcpiTables;
 use multiboot2::ModuleTag;
 use spin::{Mutex, Once, RwLock};
@@ -47,6 +47,7 @@ use x86_64::structures::paging::PhysFrame;
 use x86_64::structures::tss::TaskStateSegment;
 use x86_64::PhysAddr;
 use crate::device::pci::PciBus;
+use crate::memory::global_persistent_allocator::GlobalPersistentAllocator;
 use crate::memory::nvram_allocator::NvramAllocator;
 use crate::memory::PAGE_SIZE;
 use crate::process::process::ProcessManager;
@@ -218,12 +219,18 @@ pub fn allocator() -> &'static KernelAllocator {
     &ALLOCATOR
 }
 
-/// NVRam Allocator.
-/// Used for dynamic memory allocation in the NVRam.
-static NVRAM_ALLOCATOR: NvramAllocator = NvramAllocator::new();
+// Global Persistent Allocator
+// Used for persistent memory allocation
+static PERSISTENT_ALLOCATOR: Once<RwLock<GlobalPersistentAllocator>> = Once::new();
 
-pub fn nvram_allocator() -> &'static NvramAllocator {
-    &NVRAM_ALLOCATOR
+pub fn init_persistent_allocator(allocator: GlobalPersistentAllocator) {
+    info!("Initializing persistent allocator in global storage");
+    PERSISTENT_ALLOCATOR.call_once(|| RwLock::new(allocator));
+}
+
+pub fn persistent_allocator() -> &'static RwLock<GlobalPersistentAllocator> {
+    PERSISTENT_ALLOCATOR.get()
+        .expect("Trying to access persistent allocator before initialization!")
 }
 
 /// Kernel logger.

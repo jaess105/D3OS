@@ -250,8 +250,6 @@ pub fn init() {
                     MemorySpace::Kernel,
                     PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
                 );
-
-            ALLOCATOR.init(&spa.as_phys_frame_range());
         }
     }
 }
