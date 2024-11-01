@@ -65,6 +65,7 @@ use x86_64::structures::paging::frame::PhysFrameRange;
 use x86_64::structures::paging::page::PageRange;
 use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame};
 use x86_64::{PhysAddr, VirtAddr};
+use core::time::Duration;
 
 // import labels from linker script 'link.ld'
 unsafe extern "C" {
@@ -319,41 +320,43 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
                 as usize
                 * PAGE_SIZE;
 
-            // Initialize global persistent allocator
-            let mut global_allocator = GlobalPersistentAllocator::new(nvram_base, nvram_size);
-
-
-            // Create or recover a pool named "simon"
-            if let Some(pool) = global_allocator.get_or_create_pool(b"simon") {
-                // Use pool with transactions
-
-                info!("Komme ich bis hier ?");
-
-                match pool.transaction(|tx| {
-                    // Allocate some persistent memory
-                    let layout = Layout::from_size_align(1024, 8).unwrap();
-                    let memory = tx.allocate(layout)?;
-
-                    // Modify the allocated memory
-                    tx.modify(memory.cast::<[u8; 1024]>(), |data| {
-                        // Store some test data
-                        data[0] = 42;
-                        data[1] = 43;
-                        // Store current boot count
-                        let boot_count = data[2].wrapping_add(1);
-                        data[2] = boot_count;
-
-                        info!("Boot count: {}", boot_count);
-                    })?;
-
-                    Ok(memory)
-                }) {
-                    Ok(_) => info!("Successfully performed persistent memory transaction"),
-                    Err(e) => error!("Failed to perform persistent memory transaction: {:?}", e),
-                }
-            } else {
-                error!("Failed to create or recover persistent pool");
-            }
+            // //mesure time
+            // let start_time = timer.systime_ms();
+            // // Initialize global persistent allocator
+            // let mut global_allocator = GlobalPersistentAllocator::new(nvram_base, nvram_size);
+            //
+            // let end_time = timer.systime_ms();
+            // info!("Time to initialize global allocator: {} ms", end_time - start_time);
+            //
+            // global_allocator.get_or_create_pool(b"simon");
+            // {
+            //     // Use pool with transactions
+            //
+            //     match pool.transaction(|tx| {
+            //         // Allocate some persistent memory
+            //         let layout = Layout::from_size_align(1024, 8).unwrap();
+            //         let memory = tx.allocate(layout)?;
+            //
+            //         // Modify the allocated memory
+            //         tx.modify(memory.cast::<[u8; 1024]>(), |data| {
+            //             // Store some test data
+            //             data[0] = 42;
+            //             data[1] = 43;
+            //             // Store current boot count
+            //             let boot_count = data[2].wrapping_add(1);
+            //             data[2] = boot_count;
+            //
+            //             info!("Boot count: {}", boot_count);
+            //         })?;
+            //
+            //         Ok(memory)
+            //     }) {
+            //         Ok(_) => info!("Successfully performed persistent memory transaction"),
+            //         Err(e) => error!("Failed to perform persistent memory transaction: {:?}", e),
+            //     }
+            // } else {
+            //     error!("Failed to create or recover persistent pool");
+            // }
             // Allocate three distinct blocks in NVRAM
 
             /*
