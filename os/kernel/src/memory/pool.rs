@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use core::{mem, slice};
 use linked_list_allocator::LockedHeap;
 
-const POOL_MAGIC: u64 = 0x4433_4F53_504F4F4C;
+const POOL_MAGIC: u64 = 0x4433_4F53_504F4F4C; // "D3OS_POOL" in hex
 const PAGE_SIZE: usize = 64;
 
 #[repr(C)]

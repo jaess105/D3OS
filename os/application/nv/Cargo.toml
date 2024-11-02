@@ -12,7 +12,7 @@ path = "src/nv.rs"
 
 [dependencies]
 # Local dependencies
-runtime = { path = "../../library/runtime" }
 terminal = { path = "../../library/terminal" }
 concurrent = { path = "../../library/concurrent" }
-syscall = { path = "../../library/syscall" }
+persistent = { path = "../../library/persistent" }
+runtime = { path = "../../library/runtime" }

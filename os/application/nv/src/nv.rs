@@ -2,25 +2,66 @@
 
 extern crate alloc;
 
+use alloc::string::String;
+use persistent::{create_persistent_pool, release_persistent_pool};
+use terminal::read::read;
+use terminal::{print, println};
 #[allow(unused_imports)]
 use runtime::*;
-use terminal::{print, println};
-use syscall::{syscall, SystemCall};
 
 #[unsafe(no_mangle)]
 pub fn main() {
+    print!("Choose operation (c)reate or (r)elease pool: ");
+    //TODO: nur c und r erlauben
 
-    let pool_name = b"simon";
+    let operation = loop {
+        if let Some(ch) = read() {
+            match ch {
+                'c' | 'C' => {
+                    println!("\nCreate mode");
+                    break true;
+                }
+                'r' | 'R' => {
+                    println!("\nRelease mode");
+                    break false;
+                }
+                '\n' => continue,
+                _ => {
+                    println!("\nInvalid input! Please enter 'c' or 'r'");
+                    continue;
+                },
+            }
+        }
+    };
 
-    match syscall(
-        SystemCall::CreatePersistentPool,
-        &[
-            pool_name.as_ptr() as usize,
-            pool_name.len(),
-            0, 0, 0
-        ]
-    ) {
-        Ok(_) => println!("Successfully created/accessed pool 'test_pool'"),
-        Err(e) => println!("Failed to create pool: {:?}", e),
+    let mut input = String::new();
+    print!("Enter pool name: ");
+
+    loop {
+        match read() {
+            Some(ch) => {
+                match ch {
+                    '\n' => break,
+                    _ => {
+                        input.push(ch);
+                        //print!("{}", ch); // Echo character
+                    }
+                }
+            }
+            None => (),
+        }
+    }
+    print!("\n");
+
+    if operation {
+        match create_persistent_pool(&input) {
+            Ok(_) => println!("Successfully created/accessed pool '{}'", input),
+            Err(e) => println!("Error: {}", e),
+        }
+    } else {
+        match release_persistent_pool(&input) {
+            Ok(_) => println!("Successfully released pool '{}'", input),
+            Err(e) => println!("Error: {}", e),
+        }
     }
 }

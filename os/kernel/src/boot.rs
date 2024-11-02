@@ -314,6 +314,7 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             // }
 
             // init persistent allocator
+            //TODO: später in nvmem init reinpacken
             let nvram_base = range.as_phys_frame_range().start.start_address().as_u64();
             let nvram_size = (range.as_phys_frame_range().end - range.as_phys_frame_range().start)
                 as usize * PAGE_SIZE;
@@ -325,7 +326,7 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
 
 
             // //mesure time
-            // let start_time = timer.systime_ms();
+            //let start_time = timer.systime_ms();
             // // Initialize global persistent allocator
             // let mut global_allocator = GlobalPersistentAllocator::new(nvram_base, nvram_size);
             //

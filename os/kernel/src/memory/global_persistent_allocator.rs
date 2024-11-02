@@ -81,13 +81,14 @@ fn calculate_pool_layout(nvdimm_size: usize) -> (usize, usize) {
 
 impl GlobalPersistentAllocator {
     pub fn new(base_address: u64, nvdimm_size: usize) -> Self {
+        //TODO: in fn auslagern, falls eine der sachen != dann neu erstellen..
         info!("Creating GlobalPersistentAllocator at address: 0x{:x}", base_address);
         let metadata = base_address as *mut GlobalMetadata;
         let (max_pools, bitmap_words) = calculate_pool_layout(nvdimm_size);
 
         // Calculate offsets for different sections
         let bitmap_offset = (METADATA_SIZE + DIRECTORY_ALIGNMENT - 1) & !(DIRECTORY_ALIGNMENT - 1);
-        let mut directory_offset = bitmap_offset + (bitmap_words * 2 * size_of::<AtomicU64>());
+        let mut directory_offset = bitmap_offset + (bitmap_words * 2 * size_of::<AtomicU64>()); //2* because we have two bitmaps
         directory_offset =
             (directory_offset + DIRECTORY_ALIGNMENT - 1) & !(DIRECTORY_ALIGNMENT - 1);
 
@@ -205,13 +206,14 @@ impl GlobalPersistentAllocator {
                     if self.compare_name(name, &entry.name) {
                         if let Some(pool) = &mut entry.pool {
                             pool.recover().expect("Failed to recover pool");
+                            info!("recovered existing pool");
                             return Some(pool);
                         }
                     }
                 }
             }
 
-            info!("no pool wiht name found, creating new pool");
+            info!("no pool with name found, creating new pool");
 
             // Create new pool if not found
             for i in 0..total_pools {
@@ -263,6 +265,7 @@ impl GlobalPersistentAllocator {
                 if self.is_bit_set(i as usize, true) {
                     let entry = &mut *self.pool_directory.add(i as usize);
                     if self.compare_name(name, &entry.name) {
+                        info!("Pool found! Releasing pool: {}", core::str::from_utf8(name).unwrap());
                         // Clear bits
                         self.set_bit(i as usize, true, false); // Clear used
                         self.set_bit(i as usize, false, false); // Clear initialized

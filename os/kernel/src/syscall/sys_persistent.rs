@@ -3,16 +3,21 @@ use log::info;
 use crate::persistent_allocator;
 
 pub fn sys_create_persistent_pool(name_ptr: *const u8, name_len: usize) -> isize {
-    info!("Creating persistent pool, ptr: {:?}, len: {}", name_ptr, name_len);
-
     // Validate pointer before using it
     if name_ptr.is_null() {
         info!("Null pointer received");
         return -1;
     }
 
+    if name_len < 1 {
+        return -1;
+    }
+
+    info!("Creating persistent pool, ptr: {:?}, len: {}", name_ptr, name_len);
+
+    //TODO: Evtl noch bauen
     // Validate address range
-    // if !is_valid_user_range(name_ptr as usize, name_len) {  // You'll need to implement this
+    // if !is_valid_user_range(name_ptr as usize, name_len) {
     //     info!("Invalid memory range");
     //     return -1;
     // }
