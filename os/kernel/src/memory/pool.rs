@@ -5,6 +5,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::{mem, slice};
 use linked_list_allocator::LockedHeap;
+use log::info;
 
 const POOL_MAGIC: u64 = 0x4433_4F53_504F4F4C; // "D3OS_POOL" in hex
 const PAGE_SIZE: usize = 64;
@@ -20,6 +21,7 @@ pub struct LogEntry {
 }
 
 #[repr(u8)]
+#[derive(Debug)]
 pub enum LogType {
     Allocation = 1,
     Deallocation = 2,
@@ -97,8 +99,10 @@ impl Pool {
     where
         F: FnOnce(&mut TransactionContext) -> Result<R, TransactionError>,
     {
+        info!("Starting new transaction");
         // Start transaction
         let transaction = self.begin_transaction()?;
+        info!("Transaction initialized at address {:p}", transaction);
 
         let mut context = TransactionContext {
             pool: self,
@@ -108,13 +112,21 @@ impl Pool {
         // Execute transaction
         match f(&mut context) {
             Ok(result) => {
+                info!("Transaction operations completed successfully");
+                // Print logs before commit
+                self.print_transaction_logs(transaction);
+
                 // Commit transaction
                 self.commit_transaction(transaction)?;
+                info!("Transaction committed successfully");
                 Ok(result)
             }
             Err(e) => {
+                info!("Transaction failed, performing rollback");
+                self.print_transaction_logs(transaction);
                 // Rollback transaction
                 self.rollback_transaction(transaction)?;
+                info!("Transaction rollback completed");
                 Err(e)
             }
         }
@@ -248,6 +260,26 @@ impl Pool {
             core::arch::x86_64::_mm_sfence();
         }
     }
+
+    fn print_transaction_logs(&self, transaction: *mut Transaction) {
+        unsafe {
+            let transaction = &*transaction;
+            info!("Transaction Log Entries:");
+            info!("  Generation: {}", transaction.generation.load(Ordering::Relaxed));
+            info!("  Valid: {}", transaction.valid.load(Ordering::Relaxed));
+
+            for (i, log) in transaction.logs.iter().enumerate() {
+                info!("  Log Entry {}:", i);
+                info!("    Type: {:?}", log.typ);
+                info!("    Offset: 0x{:x}", log.offset);
+                info!("    Size: {}", log.size);
+                info!("    Generation: {}", log.generation);
+                if let Some(old_data) = log.old_data {
+                    info!("    Has backup data at: {:?}", old_data);
+                }
+            }
+        }
+    }
 }
 
 pub struct TransactionContext<'a> {
@@ -256,13 +288,17 @@ pub struct TransactionContext<'a> {
 }
 
 impl<'a> TransactionContext<'a> {
-    pub fn allocate(&mut self, layout: Layout) -> Result<NonNull<[u8]>, TransactionError> {
+    pub fn allocate<T: Copy>(&mut self, layout: Layout) -> Result<NonNull<T>, TransactionError> {
+        //let layout = Layout::new::<T>();
+
         unsafe {
             // Get locked heap and perform allocation
             let mut heap = self.pool.heap.lock();
+            info!("Allocating {} bytes", layout.size());
             let ptr = heap
                 .allocate_first_fit(layout)
                 .map_err(|_| TransactionError::AllocationFailed)?;
+            info!("Allocated at {:p}", ptr.as_ptr());
 
             // Create log entry
             let log = LogEntry {
@@ -273,31 +309,29 @@ impl<'a> TransactionContext<'a> {
                 generation: (*self.transaction).generation.load(Ordering::Relaxed),
                 checksum: 0,
             };
-
+            info!("Log created");
             // Push to logs Vec
             (*self.transaction).logs.push(log);
 
-            Ok(NonNull::slice_from_raw_parts(ptr, layout.size()))
+            Ok(ptr.cast())
         }
     }
 
-    pub fn modify<T>(
+    pub fn modify<T: Copy>(
         &mut self,
         mut ptr: NonNull<T>,
         f: impl FnOnce(&mut T),
     ) -> Result<(), TransactionError> {
         unsafe {
-            // Create backup of old data
-            let size = mem::size_of::<T>();
-            let mut old_data = Vec::with_capacity(size);
-            old_data.extend_from_slice(slice::from_raw_parts(ptr.as_ptr() as *const u8, size));
+            // Create backup of old data (since T: Copy, we can safely copy it)
+            let old_value = ptr.as_ptr().read();
 
             // Create log entry
             let log = LogEntry {
                 typ: LogType::Modification,
                 offset: ptr.as_ptr() as u64,
-                size,
-                old_data: Some(old_data.as_ptr() as *mut u8),
+                size: mem::size_of::<T>(),
+                old_data: Some(&old_value as *const T as *mut u8),
                 generation: (*self.transaction).generation.load(Ordering::Relaxed),
                 checksum: 0,
             };

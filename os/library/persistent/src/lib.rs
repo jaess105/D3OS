@@ -27,3 +27,19 @@ pub fn release_persistent_pool(name: &str) -> Result<(), &'static str> {
         Err(_) => Err("Failed to release pool"),
     }
 }
+
+pub fn perform_transaction(pool_name: &str, data: &[u8]) -> Result<(), &'static str> {
+    match syscall(
+        SystemCall::PerformTransaction,
+        &[
+            pool_name.as_ptr() as usize,
+            pool_name.len(),
+            data.as_ptr() as usize,
+            data.len(),
+            0,
+        ],
+    ) {
+        Ok(_) => Ok(()),
+        Err(_) => Err("Transaction failed"),
+    }
+}
