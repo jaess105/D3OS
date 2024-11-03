@@ -1,3 +1,4 @@
+use crate::memory::nvram_allocator::qemu_exit;
 use crate::memory::pool::Pool;
 use bitflags::bitflags;
 use core::mem;
@@ -68,7 +69,6 @@ unsafe impl Sync for GlobalPersistentAllocator {}
 fn calculate_pool_layout(nvdimm_size: usize) -> (usize, usize) {
     let aligned_metadata_size =
         (METADATA_SIZE + DIRECTORY_ALIGNMENT - 1) & !(DIRECTORY_ALIGNMENT - 1);
-    let bitmap_entry_size = core::mem::size_of::<AtomicU64>();
 
     // Calculate maximum possible pools
     let max_pools = (nvdimm_size - aligned_metadata_size) / FIXED_POOL_SIZE;
@@ -82,7 +82,10 @@ fn calculate_pool_layout(nvdimm_size: usize) -> (usize, usize) {
 impl GlobalPersistentAllocator {
     pub fn new(base_address: u64, nvdimm_size: usize) -> Self {
         //TODO: in fn auslagern, falls eine der sachen != dann neu erstellen..
-        info!("Creating GlobalPersistentAllocator at address: 0x{:x}", base_address);
+        info!(
+            "Creating GlobalPersistentAllocator at address: 0x{:x}",
+            base_address
+        );
         let metadata = base_address as *mut GlobalMetadata;
         let (max_pools, bitmap_words) = calculate_pool_layout(nvdimm_size);
 
@@ -130,21 +133,45 @@ impl GlobalPersistentAllocator {
                 info!("magicnumber: {}", (*metadata).magic_number);
                 info!("nvdimm_size: {}", (*metadata).nvdimm_size);
                 info!("pool_size: {}", (*metadata).pool_size);
-                info!("total_pools: {}", (*metadata).total_pools.load(Ordering::Acquire));
-                info!("used_pools: {}", (*metadata).used_pools.load(Ordering::Acquire));
-                info!("initialized_pools: {}", (*metadata).initialized_pools.load(Ordering::Acquire));
+                info!(
+                    "total_pools: {}",
+                    (*metadata).total_pools.load(Ordering::Acquire)
+                );
+                info!(
+                    "used_pools: {}",
+                    (*metadata).used_pools.load(Ordering::Acquire)
+                );
+                info!(
+                    "initialized_pools: {}",
+                    (*metadata).initialized_pools.load(Ordering::Acquire)
+                );
                 info!("bitmap_offset: {}", (*metadata).bitmap_offset);
-                info!("pool_directory_offset: {}", (*metadata).pool_directory_offset);
+                info!(
+                    "pool_directory_offset: {}",
+                    (*metadata).pool_directory_offset
+                );
                 info!("bitmap_words: {}", (*metadata).bitmap_words);
-                info!("initialization_failures: {}", (*metadata).initialization_failures.load(Ordering::Acquire));
-                info!("total_allocations: {}", (*metadata).total_allocations.load(Ordering::Acquire));
-                info!("total_deallocations: {}", (*metadata).total_deallocations.load(Ordering::Acquire));
-
+                info!(
+                    "initialization_failures: {}",
+                    (*metadata).initialization_failures.load(Ordering::Acquire)
+                );
+                info!(
+                    "total_allocations: {}",
+                    (*metadata).total_allocations.load(Ordering::Acquire)
+                );
+                info!(
+                    "total_deallocations: {}",
+                    (*metadata).total_deallocations.load(Ordering::Acquire)
+                );
             } else {
                 // Verify the configuration matches
                 assert_eq!((*metadata).nvdimm_size, nvdimm_size, "NVDIMM size mismatch");
                 assert_eq!((*metadata).pool_size, FIXED_POOL_SIZE, "Pool size mismatch");
                 info!("Recovered existing NVDIMM metadata");
+                info!(
+                    "{} used pools were found",
+                    (*metadata).used_pools.load(Ordering::Acquire)
+                );
             }
         }
 
@@ -174,10 +201,12 @@ impl GlobalPersistentAllocator {
 
         let word = self.get_bitmap_word(is_used, word_index);
 
+        //Thread safety:
+        //Changed to Acquire and Release to ensure that the bit is set before the pool is used
         if value {
-            word.fetch_or(mask, Ordering::SeqCst);
+            word.fetch_or(mask, Ordering::Release);
         } else {
-            word.fetch_and(!mask, Ordering::SeqCst);
+            word.fetch_and(!mask, Ordering::Acquire);
         }
     }
 
@@ -196,28 +225,30 @@ impl GlobalPersistentAllocator {
             return None;
         }
 
-        unsafe {
-            // First try to find existing pool
-            let total_pools = (*self.metadata).total_pools.load(Ordering::Acquire);
-            for i in 0..total_pools {
-                // Check if pool is used in bitmap
-                if self.is_bit_set(i as usize, true) {
+        // Add pool-level locking
+        let total_pools = unsafe { (*self.metadata).total_pools.load(Ordering::Acquire) };
+
+        // First try to find existing pool
+        for i in 0..total_pools {
+            if self.is_bit_set(i as usize, true) {
+                unsafe {
                     let entry = &mut *self.pool_directory.add(i as usize);
+                    // Add entry-level synchronization
                     if self.compare_name(name, &entry.name) {
                         if let Some(pool) = &mut entry.pool {
-                            pool.recover().expect("Failed to recover pool");
-                            info!("recovered existing pool");
                             return Some(pool);
                         }
                     }
                 }
             }
+        }
 
-            info!("no pool with name found, creating new pool");
+        info!("no pool with name found, creating new pool");
 
-            // Create new pool if not found
-            for i in 0..total_pools {
-                // Find first unused slot in bitmap
+        // Create new pool if not found
+        for i in 0..total_pools {
+            // Find first unused slot in bitmap
+            unsafe {
                 if !self.is_bit_set(i as usize, true) {
                     let entry = &mut *self.pool_directory.add(i as usize);
                     info!("found empty slot in bitmap");
@@ -225,7 +256,8 @@ impl GlobalPersistentAllocator {
                     // Calculate pool address
                     let pool_offset = self.get_pool_data_offset();
                     info!("Pool offset: 0x{:x}", pool_offset);
-                    let pool_address = self.base_address + pool_offset + (i as u64 * FIXED_POOL_SIZE as u64);
+                    let pool_address =
+                        self.base_address + pool_offset + (i as u64 * FIXED_POOL_SIZE as u64);
                     info!("Calculated pool address: 0x{:x}", pool_address);
 
                     // Create new pool
@@ -236,6 +268,7 @@ impl GlobalPersistentAllocator {
                     ptr::copy_nonoverlapping(name.as_ptr(), entry.name.as_mut_ptr(), name.len());
                     entry.name[name.len()] = 0;
                     entry.pool = Some(pool);
+                    info!("directory entry updated");
 
                     // Set both initialized and used bits
                     self.set_bit(i as usize, false, true); // Set initialized
@@ -265,7 +298,10 @@ impl GlobalPersistentAllocator {
                 if self.is_bit_set(i as usize, true) {
                     let entry = &mut *self.pool_directory.add(i as usize);
                     if self.compare_name(name, &entry.name) {
-                        info!("Pool found! Releasing pool: {}", core::str::from_utf8(name).unwrap());
+                        info!(
+                            "Pool found! Releasing pool: {}",
+                            core::str::from_utf8(name).unwrap()
+                        );
                         // Clear bits
                         self.set_bit(i as usize, true, false); // Clear used
                         self.set_bit(i as usize, false, false); // Clear initialized
@@ -290,15 +326,22 @@ impl GlobalPersistentAllocator {
 
     fn get_pool_data_offset(&self) -> u64 {
         info!("Calculating pool data offset:");
-        info!("  pool_directory_offset: 0x{:x}", unsafe { (*self.metadata).pool_directory_offset });
-        info!("  total_pools: {}", unsafe { (*self.metadata).total_pools.load(Ordering::Relaxed) });
-        info!("  sizeof PoolDirectoryEntry: {}", mem::size_of::<PoolDirectoryEntry>());
+        info!("  pool_directory_offset: 0x{:x}", unsafe {
+            (*self.metadata).pool_directory_offset
+        });
+        info!("  total_pools: {}", unsafe {
+            (*self.metadata).total_pools.load(Ordering::Relaxed)
+        });
+        info!(
+            "  sizeof PoolDirectoryEntry: {}",
+            mem::size_of::<PoolDirectoryEntry>()
+        );
 
         let offset = unsafe {
             // Remove self.base_address from here
             (*self.metadata).pool_directory_offset
                 + ((*self.metadata).total_pools.load(Ordering::Relaxed) as usize
-                * mem::size_of::<PoolDirectoryEntry>()) as u64
+                    * mem::size_of::<PoolDirectoryEntry>()) as u64
         };
 
         info!("  Final offset: 0x{:x}", offset);
@@ -317,7 +360,10 @@ impl GlobalPersistentAllocator {
     }
 
     pub fn recover(&mut self) -> bool {
-        info!("Attempting to recover at address: 0x{:x}", self.base_address);
+        info!(
+            "Attempting to recover at address: 0x{:x}",
+            self.base_address
+        );
         unsafe { (*self.metadata).magic_number == ALLOCATOR_MAGIC }
     }
 }

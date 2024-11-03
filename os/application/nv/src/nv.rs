@@ -12,7 +12,6 @@ use runtime::*;
 #[unsafe(no_mangle)]
 pub fn main() {
     print!("Choose operation (c)reate or (r)elease pool: ");
-    //TODO: nur c und r erlauben
 
     let operation = loop {
         if let Some(ch) = read() {
