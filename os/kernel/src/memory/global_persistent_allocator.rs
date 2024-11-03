@@ -62,6 +62,15 @@ pub(crate) struct GlobalPersistentAllocator {
     pool_directory: *mut PoolDirectoryEntry,
 }
 
+#[derive(Debug)]
+pub enum RecoveryError {
+    MetadataCorrupted,
+    BitmapInconsistent,
+    PoolHeaderInvalid,
+    TransactionIncomplete,
+    ChecksumMismatch,
+}
+
 unsafe impl Send for GlobalPersistentAllocator {}
 unsafe impl Sync for GlobalPersistentAllocator {}
 
@@ -118,69 +127,41 @@ impl GlobalPersistentAllocator {
                     total_deallocations: AtomicUsize::new(0),
                 });
 
-                // Initialize bitmap words to 0
-                for i in 0..bitmap_words {
-                    // Initialize initialized_bits
-                    ptr::write((bitmap as *mut AtomicU64).add(i), AtomicU64::new(0));
-                    // Initialize used_bits
-                    ptr::write(
-                        (bitmap as *mut AtomicU64).add(bitmap_words + i),
-                        AtomicU64::new(0),
-                    );
+                // Ensure it's persisted
+                core::arch::x86_64::_mm_sfence();
+                core::arch::x86_64::_mm_clflush(metadata as *const u8);
+                core::arch::x86_64::_mm_sfence();
+
+
+                // Initialize bitmap (also can be done in one write per bitmap)
+                let bitmap = (base_address + bitmap_offset as u64) as *mut AtomicU64;
+                for i in 0..bitmap_words * 2 {  // *2 for both bitmaps
+                    ptr::write(bitmap.add(i), AtomicU64::new(0));
                 }
 
-                //debug info of all metadata:
-                info!("magicnumber: {}", (*metadata).magic_number);
-                info!("nvdimm_size: {}", (*metadata).nvdimm_size);
-                info!("pool_size: {}", (*metadata).pool_size);
-                info!(
-                    "total_pools: {}",
-                    (*metadata).total_pools.load(Ordering::Acquire)
-                );
-                info!(
-                    "used_pools: {}",
-                    (*metadata).used_pools.load(Ordering::Acquire)
-                );
-                info!(
-                    "initialized_pools: {}",
-                    (*metadata).initialized_pools.load(Ordering::Acquire)
-                );
-                info!("bitmap_offset: {}", (*metadata).bitmap_offset);
-                info!(
-                    "pool_directory_offset: {}",
-                    (*metadata).pool_directory_offset
-                );
-                info!("bitmap_words: {}", (*metadata).bitmap_words);
-                info!(
-                    "initialization_failures: {}",
-                    (*metadata).initialization_failures.load(Ordering::Acquire)
-                );
-                info!(
-                    "total_allocations: {}",
-                    (*metadata).total_allocations.load(Ordering::Acquire)
-                );
-                info!(
-                    "total_deallocations: {}",
-                    (*metadata).total_deallocations.load(Ordering::Acquire)
-                );
+                // Ensure bitmap is persisted
+                core::arch::x86_64::_mm_sfence();
+                for i in 0..bitmap_words * 2 {
+                    core::arch::x86_64::_mm_clflush(bitmap.add(i) as *const u8);
+                }
+                core::arch::x86_64::_mm_sfence();
+
             } else {
                 // Verify the configuration matches
                 assert_eq!((*metadata).nvdimm_size, nvdimm_size, "NVDIMM size mismatch");
                 assert_eq!((*metadata).pool_size, FIXED_POOL_SIZE, "Pool size mismatch");
                 info!("Recovered existing NVDIMM metadata");
-                info!(
-                    "{} used pools were found",
-                    (*metadata).used_pools.load(Ordering::Acquire)
-                );
             }
         }
 
-        Self {
+        let alloc = Self {
             base_address,
             metadata,
             bitmap,
             pool_directory,
-        }
+        };
+        alloc.print_metadata_debug_info();
+        alloc
     }
 
     fn get_bitmap_word(&self, is_used: bool, index: usize) -> &AtomicU64 {
@@ -201,13 +182,11 @@ impl GlobalPersistentAllocator {
 
         let word = self.get_bitmap_word(is_used, word_index);
 
-        //Thread safety:
-        //Changed to Acquire and Release to ensure that the bit is set before the pool is used
         if value {
-            word.fetch_or(mask, Ordering::Release);
+            word.fetch_or(mask, Ordering::SeqCst)
         } else {
-            word.fetch_and(!mask, Ordering::Acquire);
-        }
+            word.fetch_and(!mask, Ordering::SeqCst)
+        };
     }
 
     fn is_bit_set(&self, pool_index: usize, is_used: bool) -> bool {
@@ -225,7 +204,6 @@ impl GlobalPersistentAllocator {
             return None;
         }
 
-        // Add pool-level locking
         let total_pools = unsafe { (*self.metadata).total_pools.load(Ordering::Acquire) };
 
         // First try to find existing pool
@@ -233,9 +211,10 @@ impl GlobalPersistentAllocator {
             if self.is_bit_set(i as usize, true) {
                 unsafe {
                     let entry = &mut *self.pool_directory.add(i as usize);
-                    // Add entry-level synchronization
                     if self.compare_name(name, &entry.name) {
                         if let Some(pool) = &mut entry.pool {
+                            info!("Pool with name found: {}", core::str::from_utf8(name).unwrap());
+                            self.print_metadata_debug_info();
                             return Some(pool);
                         }
                     }
@@ -247,41 +226,43 @@ impl GlobalPersistentAllocator {
 
         // Create new pool if not found
         for i in 0..total_pools {
-            // Find first unused slot in bitmap
             unsafe {
                 if !self.is_bit_set(i as usize, true) {
                     let entry = &mut *self.pool_directory.add(i as usize);
                     info!("found empty slot in bitmap");
 
-                    // Calculate pool address
                     let pool_offset = self.get_pool_data_offset();
-                    info!("Pool offset: 0x{:x}", pool_offset);
-                    let pool_address =
-                        self.base_address + pool_offset + (i as u64 * FIXED_POOL_SIZE as u64);
-                    info!("Calculated pool address: 0x{:x}", pool_address);
+                    let pool_address = self.base_address + pool_offset + (i as u64 * FIXED_POOL_SIZE as u64);
 
                     // Create new pool
                     let pool = Pool::new(pool_address, FIXED_POOL_SIZE);
-                    info!("new pool created");
 
                     // Update directory entry
-                    ptr::copy_nonoverlapping(name.as_ptr(), entry.name.as_mut_ptr(), name.len());
-                    entry.name[name.len()] = 0;
-                    entry.pool = Some(pool);
-                    info!("directory entry updated");
+                    let mut new_entry = PoolDirectoryEntry {
+                        name: [0; 64],
+                        pool: Some(pool),
+                        _padding: [0; 8],
+                    };
+                    ptr::copy_nonoverlapping(name.as_ptr(), new_entry.name.as_mut_ptr(), name.len());
+                    new_entry.name[name.len()] = 0;
 
-                    // Set both initialized and used bits
+                    // Important: First persist the directory entry
+                    self.ensure_persistent_write(entry, new_entry);
+
+                    // Now set the bitmap bits - order matters!
                     self.set_bit(i as usize, false, true); // Set initialized
-                    self.set_bit(i as usize, true, true); // Set used
+                    self.persist_bitmap_word(i as usize, false);
 
-                    // Update metadata counters
+                    self.set_bit(i as usize, true, true); // Set used
+                    self.persist_bitmap_word(i as usize, true);
+
+                    // Update and persist metadata counters
                     (*self.metadata).used_pools.fetch_add(1, Ordering::Release);
-                    (*self.metadata)
-                        .initialized_pools
-                        .fetch_add(1, Ordering::Release);
-                    (*self.metadata)
-                        .total_allocations
-                        .fetch_add(1, Ordering::Release);
+                    (*self.metadata).initialized_pools.fetch_add(1, Ordering::Release);
+                    (*self.metadata).total_allocations.fetch_add(1, Ordering::Release);
+
+                    // Ensure metadata counters are persisted
+                    self.persist_metadata_counters();
 
                     return entry.pool.as_mut();
                 }
@@ -289,6 +270,7 @@ impl GlobalPersistentAllocator {
         }
         None
     }
+
 
     // You might also want to add a method to release/delete pools:
     pub fn release_pool(&mut self, name: &[u8]) -> bool {
@@ -308,13 +290,14 @@ impl GlobalPersistentAllocator {
 
                         // Update metadata
                         (*self.metadata).used_pools.fetch_sub(1, Ordering::Release);
-                        (*self.metadata)
-                            .total_deallocations
-                            .fetch_add(1, Ordering::Release);
+                        (*self.metadata).total_deallocations.fetch_add(1, Ordering::Release);
 
                         // Clear entry
-                        entry.pool = None;
-                        entry.name = [0; 64];
+                        self.ensure_persistent_write(entry, PoolDirectoryEntry {
+                            name: [0; 64],
+                            pool: None,
+                            _padding: [0; 8],
+                        });
 
                         return true;
                     }
@@ -341,7 +324,7 @@ impl GlobalPersistentAllocator {
             // Remove self.base_address from here
             (*self.metadata).pool_directory_offset
                 + ((*self.metadata).total_pools.load(Ordering::Relaxed) as usize
-                    * mem::size_of::<PoolDirectoryEntry>()) as u64
+                * mem::size_of::<PoolDirectoryEntry>()) as u64
         };
 
         info!("  Final offset: 0x{:x}", offset);
@@ -359,11 +342,148 @@ impl GlobalPersistentAllocator {
         i < 64 && entry_name[i] == 0
     }
 
-    pub fn recover(&mut self) -> bool {
-        info!(
-            "Attempting to recover at address: 0x{:x}",
-            self.base_address
-        );
-        unsafe { (*self.metadata).magic_number == ALLOCATOR_MAGIC }
+    fn ensure_persistent_write<T>(&self, addr: *mut T, value: T) {
+        unsafe {
+            // Write value
+            ptr::write_volatile(addr, value);
+
+            // Ensure persistence
+            core::arch::x86_64::_mm_sfence();
+            core::arch::x86_64::_mm_clflush(addr as *const u8);
+            core::arch::x86_64::_mm_sfence();
+        }
+    }
+
+    fn persist_bitmap_word(&self, pool_index: usize, is_used: bool) {
+        let word_index = pool_index / BITS_PER_WORD;
+        let word = self.get_bitmap_word(is_used, word_index);
+
+        unsafe {
+            core::arch::x86_64::_mm_sfence();
+            core::arch::x86_64::_mm_clflush(word as *const _ as *const u8);
+            core::arch::x86_64::_mm_sfence();
+        }
+    }
+
+    fn persist_metadata_counters(&self) {
+        unsafe {
+            let metadata = &*self.metadata;
+            core::arch::x86_64::_mm_sfence();
+
+            // Flush the atomic counters
+            core::arch::x86_64::_mm_clflush(&metadata.used_pools as *const _ as *const u8);
+            core::arch::x86_64::_mm_clflush(&metadata.initialized_pools as *const _ as *const u8);
+            core::arch::x86_64::_mm_clflush(&metadata.total_allocations as *const _ as *const u8);
+
+            core::arch::x86_64::_mm_sfence();
+        }
+    }
+
+    pub fn recover_after_crash(&mut self) -> Result<(), RecoveryError> {
+        info!("Starting recovery process...");
+
+        // 1. Verify metadata
+        if !self.verify_metadata() {
+            return Err(RecoveryError::MetadataCorrupted);
+        }
+
+        // 2. Check bitmap consistency
+        if !self.verify_bitmap_consistency() {
+            return Err(RecoveryError::BitmapInconsistent);
+        }
+
+        //TODO: Später einfügen
+        // 3. Scan and recover pools
+        //self.recover_pools()?;
+
+        info!("Recovery completed successfully");
+        Ok(())
+    }
+
+    fn verify_metadata(&self) -> bool {
+        unsafe {
+            // Check magic number
+            if (*self.metadata).magic_number != ALLOCATOR_MAGIC {
+                return false;
+            }
+
+            // Verify size constraints
+            if (*self.metadata).nvdimm_size < METADATA_SIZE {
+                return false;
+            }
+
+            if (*self.metadata).pool_size != FIXED_POOL_SIZE {
+                return false;
+            }
+            //TODO: Noch drüber nachdenken ob sich mehr lohnt ?
+            
+            true
+        }
+    }
+
+    fn verify_bitmap_consistency(&self) -> bool {
+        // Verify that used_pools count matches bitmap
+        let mut count = 0;
+        let total_pools = unsafe { (*self.metadata).total_pools.load(Ordering::Relaxed) };
+
+        for i in 0..total_pools {
+            if self.is_bit_set(i as usize, true) {
+                count += 1;
+            }
+        }
+
+        unsafe {
+            count == (*self.metadata).used_pools.load(Ordering::Relaxed)
+        }
+    }
+
+    fn recover_pools(&mut self) -> Result<(), RecoveryError> {
+        let total_pools = unsafe { (*self.metadata).total_pools.load(Ordering::Relaxed) };
+
+        for i in 0..total_pools {
+            if self.is_bit_set(i as usize, true) {
+                unsafe {
+                    let entry = &mut *self.pool_directory.add(i as usize);
+                    if let Some(pool) = &mut entry.pool {
+                        pool.recover().map_err(|_| RecoveryError::PoolHeaderInvalid)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn print_metadata_debug_info(&self) {
+        unsafe {
+            info!("=== NVDIMM Metadata Debug Info ===");
+            info!("Base address: 0x{:x}", self.base_address);
+            info!("Magic number: 0x{:x}", (*self.metadata).magic_number);
+            info!("NVDIMM size: {} bytes ({} MB)",
+                (*self.metadata).nvdimm_size,
+                (*self.metadata).nvdimm_size / (1024 * 1024));
+            info!("Pool size: {} bytes ({} KB)",
+                (*self.metadata).pool_size,
+                (*self.metadata).pool_size / 1024);
+
+            // Pool information
+            info!("Total pools: {}", (*self.metadata).total_pools.load(Ordering::Acquire));
+            info!("Used pools: {}", (*self.metadata).used_pools.load(Ordering::Acquire));
+            info!("Initialized pools: {}", (*self.metadata).initialized_pools.load(Ordering::Acquire));
+
+            // Layout information
+            info!("Bitmap offset: 0x{:x}", (*self.metadata).bitmap_offset);
+            info!("Pool directory offset: 0x{:x}", (*self.metadata).pool_directory_offset);
+            info!("Bitmap words: {}", (*self.metadata).bitmap_words);
+
+            // Statistics
+            info!("=== Statistics ===");
+            info!("Initialization failures: {}",
+                (*self.metadata).initialization_failures.load(Ordering::Acquire));
+            info!("Total allocations: {}",
+                (*self.metadata).total_allocations.load(Ordering::Acquire));
+            info!("Total deallocations: {}",
+                (*self.metadata).total_deallocations.load(Ordering::Acquire));
+            info!("==============================");
+        }
     }
 }
