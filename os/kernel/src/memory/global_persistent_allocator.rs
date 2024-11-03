@@ -63,12 +63,12 @@ pub(crate) struct GlobalPersistentAllocator {
 }
 
 #[derive(Debug)]
-pub enum RecoveryError {
-    MetadataCorrupted,
-    BitmapInconsistent,
-    PoolHeaderInvalid,
-    TransactionIncomplete,
-    ChecksumMismatch,
+pub struct RecoveryStatus {
+    metadata_valid: bool,
+    bitmap_consistent: bool,
+    used_pools: u32,
+    total_pools: u32,
+    initialization_failures: u32,
 }
 
 unsafe impl Send for GlobalPersistentAllocator {}
@@ -89,23 +89,34 @@ fn calculate_pool_layout(nvdimm_size: usize) -> (usize, usize) {
 }
 
 impl GlobalPersistentAllocator {
+    fn check_recovery_status(&self) -> RecoveryStatus {
+        unsafe {
+            RecoveryStatus {
+                metadata_valid: self.verify_metadata(),
+                bitmap_consistent: self.verify_bitmap_consistency(),
+                used_pools: (*self.metadata).used_pools.load(Ordering::Acquire),
+                total_pools: (*self.metadata).total_pools.load(Ordering::Acquire),
+                initialization_failures: (*self.metadata).initialization_failures.load(Ordering::Acquire),
+            }
+        }
+    }
+
     pub fn new(base_address: u64, nvdimm_size: usize) -> Self {
-        //TODO: in fn auslagern, falls eine der sachen != dann neu erstellen..
-        info!(
-            "Creating GlobalPersistentAllocator at address: 0x{:x}",
-            base_address
-        );
+        info!("Trying to create a GlobalPersistentAllocator at address: 0x{:x}", base_address);
         let metadata = base_address as *mut GlobalMetadata;
         let (max_pools, bitmap_words) = calculate_pool_layout(nvdimm_size);
 
-        // Calculate offsets for different sections
+        // Calculate offsets...
         let bitmap_offset = (METADATA_SIZE + DIRECTORY_ALIGNMENT - 1) & !(DIRECTORY_ALIGNMENT - 1);
-        let mut directory_offset = bitmap_offset + (bitmap_words * 2 * size_of::<AtomicU64>()); //2* because we have two bitmaps
-        directory_offset =
-            (directory_offset + DIRECTORY_ALIGNMENT - 1) & !(DIRECTORY_ALIGNMENT - 1);
+        let directory_offset = bitmap_offset + (bitmap_words * 2 * size_of::<AtomicU64>());
+        let directory_offset = (directory_offset + DIRECTORY_ALIGNMENT - 1) & !(DIRECTORY_ALIGNMENT - 1);
 
-        let bitmap = (base_address + bitmap_offset as u64) as *mut PoolBitmap;
-        let pool_directory = (base_address + directory_offset as u64) as *mut PoolDirectoryEntry;
+        let allocator = Self {
+            base_address,
+            metadata,
+            bitmap: (base_address + bitmap_offset as u64) as *mut PoolBitmap,
+            pool_directory: (base_address + directory_offset as u64) as *mut PoolDirectoryEntry,
+        };
 
         unsafe {
             if (*metadata).magic_number != ALLOCATOR_MAGIC {
@@ -145,23 +156,25 @@ impl GlobalPersistentAllocator {
                     core::arch::x86_64::_mm_clflush(bitmap.add(i) as *const u8);
                 }
                 core::arch::x86_64::_mm_sfence();
+                allocator.print_metadata_debug_info();
 
             } else {
-                // Verify the configuration matches
-                assert_eq!((*metadata).nvdimm_size, nvdimm_size, "NVDIMM size mismatch");
-                assert_eq!((*metadata).pool_size, FIXED_POOL_SIZE, "Pool size mismatch");
-                info!("Recovered existing NVDIMM metadata");
+                info!("Found existing NVDIMM metadata, checking status");
+                let status = allocator.check_recovery_status();
+
+                if !status.metadata_valid || !status.bitmap_consistent {
+                    info!("Recovery check failed: {:?}, reinitializing", status);
+                    //TODO: Init code wieder callen .. vielleicht geht das noch besser ?
+                } else {
+                    info!("Recovery check successful: {:?}", status);
+                    // Verify configuration
+                    assert_eq!((*metadata).nvdimm_size, nvdimm_size, "NVDIMM size mismatch");
+                    assert_eq!((*metadata).pool_size, FIXED_POOL_SIZE, "Pool size mismatch");
+                }
+
             }
         }
-
-        let alloc = Self {
-            base_address,
-            metadata,
-            bitmap,
-            pool_directory,
-        };
-        alloc.print_metadata_debug_info();
-        alloc
+        allocator
     }
 
     fn get_bitmap_word(&self, is_used: bool, index: usize) -> &AtomicU64 {
@@ -379,27 +392,6 @@ impl GlobalPersistentAllocator {
         }
     }
 
-    pub fn recover_after_crash(&mut self) -> Result<(), RecoveryError> {
-        info!("Starting recovery process...");
-
-        // 1. Verify metadata
-        if !self.verify_metadata() {
-            return Err(RecoveryError::MetadataCorrupted);
-        }
-
-        // 2. Check bitmap consistency
-        if !self.verify_bitmap_consistency() {
-            return Err(RecoveryError::BitmapInconsistent);
-        }
-
-        //TODO: Später einfügen
-        // 3. Scan and recover pools
-        //self.recover_pools()?;
-
-        info!("Recovery completed successfully");
-        Ok(())
-    }
-
     fn verify_metadata(&self) -> bool {
         unsafe {
             // Check magic number
@@ -435,22 +427,6 @@ impl GlobalPersistentAllocator {
         unsafe {
             count == (*self.metadata).used_pools.load(Ordering::Relaxed)
         }
-    }
-
-    fn recover_pools(&mut self) -> Result<(), RecoveryError> {
-        let total_pools = unsafe { (*self.metadata).total_pools.load(Ordering::Relaxed) };
-
-        for i in 0..total_pools {
-            if self.is_bit_set(i as usize, true) {
-                unsafe {
-                    let entry = &mut *self.pool_directory.add(i as usize);
-                    if let Some(pool) = &mut entry.pool {
-                        pool.recover().map_err(|_| RecoveryError::PoolHeaderInvalid)?;
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 
     fn print_metadata_debug_info(&self) {
