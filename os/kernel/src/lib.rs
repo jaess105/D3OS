@@ -48,7 +48,6 @@ use x86_64::structures::tss::TaskStateSegment;
 use x86_64::PhysAddr;
 use crate::device::pci::PciBus;
 use crate::memory::global_persistent_allocator::GlobalPersistentAllocator;
-use crate::memory::nvram_allocator::NvramAllocator;
 use crate::memory::PAGE_SIZE;
 use crate::process::process::ProcessManager;
 use crate::syscall::syscall_dispatcher::CoreLocalStorage;

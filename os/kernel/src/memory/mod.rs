@@ -1,7 +1,6 @@
 pub mod alloc;
 pub mod global_persistent_allocator;
 pub mod nvmem;
-pub mod nvram_allocator;
 pub mod physical;
 pub mod r#virtual;
 

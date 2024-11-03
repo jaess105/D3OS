@@ -1,5 +1,4 @@
 use crate::memory::MemorySpace;
-use crate::memory::nvram_allocator::NvramAllocator;
 use crate::{acpi_tables, process_manager};
 use acpi::AcpiTable;
 use acpi::sdt::{SdtHeader, Signature};
@@ -216,8 +215,6 @@ impl FlushHintAddressStructure {
         return hints;
     }
 }
-
-pub(crate) static ALLOCATOR: NvramAllocator = NvramAllocator::new();
 
 pub fn init() {
     if let Ok(nfit) = acpi_tables().lock().find_table::<Nfit>() {

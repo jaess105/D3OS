@@ -1,4 +1,3 @@
-use crate::memory::nvram_allocator::qemu_exit;
 use crate::memory::pool::Pool;
 use bitflags::bitflags;
 use core::mem;
@@ -6,6 +5,7 @@ use core::mem::size_of;
 use core::ptr;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use log::info;
+use x86_64::instructions::port::Port;
 
 const ALLOCATOR_MAGIC: u64 = 0x4433_4F53_4E56_4D4D; // "D3OS_NVMM"
 const FIXED_POOL_SIZE: usize = 1024; // 1KB
@@ -462,4 +462,12 @@ impl GlobalPersistentAllocator {
             info!("==============================");
         }
     }
+}
+
+pub(crate) fn qemu_exit(exit_code: u32) -> ! {
+    unsafe {
+        let mut port = Port::new(0xf4);
+        port.write(exit_code as u32);
+    }
+    loop {}
 }
