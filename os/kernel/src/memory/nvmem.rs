@@ -1,21 +1,16 @@
-use crate::memory::MemorySpace;
-use crate::{acpi_tables, process_manager};
+use alloc::vec::Vec;
+use core::ptr;
+use core::cmp::PartialEq;
 use acpi::AcpiTable;
 use acpi::sdt::{SdtHeader, Signature};
-use alloc::vec::Vec;
 use bitflags::bitflags;
-use core::alloc::{AllocError, Allocator, Layout};
-use core::cmp::PartialEq;
-use core::ptr;
-use core::ptr::NonNull;
 use log::info;
-use uefi::table::boot::PAGE_SIZE;
+use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame};
 use x86_64::structures::paging::frame::PhysFrameRange;
 use x86_64::structures::paging::page::PageRange;
-use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame};
 use x86_64::{PhysAddr, VirtAddr};
-
-const ALLOCATOR_MAGIC: u64 = 0x4433_4F53_4E56_4D4D; // "D3OS_NVMM" in hex
+use crate::{acpi_tables, process_manager};
+use crate::memory::{MemorySpace, PAGE_SIZE};
 
 #[allow(dead_code)]
 #[repr(u16)]
@@ -132,7 +127,7 @@ pub struct NvdimmControlRegionStructure {
 pub struct FlushHintAddressStructure {
     header: NfitStructureHeader,
     device_handle: u32,
-    hint_count: u16,
+    hint_count: u16
 }
 
 unsafe impl AcpiTable for Nfit {
@@ -155,8 +150,7 @@ impl Nfit {
                 let structure = *structure_ptr;
                 tables.push(structure_ptr.as_ref().expect("Invalid NFIT structure"));
 
-                structure_ptr = (structure_ptr as *const u8).add(structure.length as usize)
-                    as *const NfitStructureHeader;
+                structure_ptr = (structure_ptr as *const u8).add(structure.length as usize) as *const NfitStructureHeader;
                 remaining = remaining - structure.length as usize;
             }
         }
@@ -164,7 +158,7 @@ impl Nfit {
         return tables;
     }
 
-    pub fn get_phys_addr_ranges(&self) -> Vec<&SystemPhysicalAddressRange> {
+    pub fn get_phys_addr_ranges (&self) -> Vec<&SystemPhysicalAddressRange> {
         let mut ranges = Vec::<&SystemPhysicalAddressRange>::new();
 
         self.get_structures().iter().for_each(|structure| {
@@ -181,23 +175,16 @@ impl Nfit {
 impl NfitStructureHeader {
     pub fn as_structure<T>(&self) -> &T {
         unsafe {
-            ptr::from_ref(self)
-                .cast::<T>()
-                .as_ref()
-                .expect("Invalid NFIT structure")
+            ptr::from_ref(self).cast::<T>().as_ref().expect("Invalid NFIT structure")
         }
     }
 }
 
 impl SystemPhysicalAddressRange {
     pub fn as_phys_frame_range(&self) -> PhysFrameRange {
-        let start =
-            PhysFrame::from_start_address(PhysAddr::new(self.base)).expect("Invalid start address");
+        let start = PhysFrame::from_start_address(PhysAddr::new(self.base)).expect("Invalid start address");
 
-        return PhysFrameRange {
-            start,
-            end: start + (self.length / PAGE_SIZE as u64),
-        };
+        return PhysFrameRange { start, end: start + (self.length / PAGE_SIZE as u64) };
     }
 }
 
@@ -225,51 +212,13 @@ pub fn init() {
             // Copy values to avoid unaligned access of packed struct fields
             let address = spa.base;
             let length = spa.length;
-            info!(
-                "Found non-volatile memory (Address: [0x{:x}], Length: [{} MiB])",
-                address,
-                length / 1024 / 1024
-            );
-            info!("With real length: {}", length);
+            info!("Found non-volatile memory (Address: [0x{:x}], Length: [{} MiB])", address, length / 1024 / 1024);
 
             // Map non-volatile memory range to kernel address space
             let start_page = Page::from_start_address(VirtAddr::new(address)).unwrap();
-            process_manager()
-                .read()
-                .kernel_process()
-                .expect("Failed to get kernel process")
+            process_manager().read().kernel_process().expect("Failed to get kernel process")
                 .address_space()
-                .map(
-                    PageRange {
-                        start: start_page,
-                        end: start_page + (length / PAGE_SIZE as u64),
-                    },
-                    MemorySpace::Kernel,
-                    PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-                );
+                .map(PageRange { start: start_page, end: start_page + (length / PAGE_SIZE as u64) }, MemorySpace::Kernel, PageTableFlags::PRESENT | PageTableFlags::WRITABLE);
         }
     }
-}
-
-pub struct Locked<A> {
-    inner: spin::Mutex<A>,
-}
-
-impl<A> Locked<A> {
-    pub const fn new(inner: A) -> Self {
-        Locked {
-            inner: spin::Mutex::new(inner),
-        }
-    }
-
-    pub fn lock(&self) -> spin::MutexGuard<A> {
-        self.inner.lock()
-    }
-}
-
-/// Align the given address `addr` upwards to alignment `align`.
-///
-/// Requires that `align` is a power of two.
-pub fn align_up(addr: usize, align: usize) -> usize {
-    (addr + align - 1) & !(align - 1)
 }
