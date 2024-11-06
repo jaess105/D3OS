@@ -9,7 +9,7 @@
 */
 
 use crate::interrupt::interrupt_dispatcher;
-use crate::{naming, efi_services_available};
+use crate::{naming, efi_services_available, init_persistent_allocator};
 use crate::syscall::syscall_dispatcher;
 use crate::process::thread::Thread;
 use alloc::format;
@@ -50,6 +50,7 @@ use crate::device::ps2::Keyboard;
 use crate::device::qemu_cfg;
 use crate::device::serial::SerialPort;
 use crate::memory::{MemorySpace, nvmem, PAGE_SIZE};
+use crate::memory::global_persistent_allocator::GlobalPersistentAllocator;
 use crate::memory::nvmem::Nfit;
 use crate::memory::r#virtual::page_table_index;
 use crate::network::rtl8139;
@@ -224,17 +225,26 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             let date_ptr = range.as_phys_frame_range().start.start_address().as_u64() as *mut Time;
 
             // Read last boot time from NVRAM
-            let date = unsafe { date_ptr.read() };
-            if date.is_valid().is_ok() {
-                info!("Last boot time: [{:0>4}-{:0>2}-{:0>2} {:0>2}:{:0>2}:{:0>2}]", date.year(), date.month(), date.day(), date.hour(), date.minute(), date.second());
-            }
+            // let date = unsafe { date_ptr.read() };
+            // if date.is_valid().is_ok() {
+            //     info!("Last boot time: [{:0>4}-{:0>2}-{:0>2} {:0>2}:{:0>2}:{:0>2}]", date.year(), date.month(), date.day(), date.hour(), date.minute(), date.second());
+            // }
+            //
+            // // Write current boot time to NVRAM
+            // if efi_services_available() {
+            //     if let Ok(time) = uefi::runtime::get_time() {
+            //         unsafe { date_ptr.write(time) }
+            //     }
+            // }
 
-            // Write current boot time to NVRAM
-            if efi_services_available() {
-                if let Ok(time) = uefi::runtime::get_time() {
-                    unsafe { date_ptr.write(time) }
-                }
-            }
+            let nvram_base = range.as_phys_frame_range().start.start_address().as_u64();
+            let nvram_size = (range.as_phys_frame_range().end - range.as_phys_frame_range().start)
+                as usize * PAGE_SIZE;
+
+            let allocator = GlobalPersistentAllocator::new(nvram_base, nvram_size);
+            info!("About to store allocator in global storage");
+            init_persistent_allocator(allocator);
+
         }
     }
 
