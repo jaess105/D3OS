@@ -93,7 +93,7 @@ impl Apic {
 
                 // Iterate over IO APIC entries in MADT and initialize IO APICs (should only be a single one on most systems)
                 for (i, io_apic_desc) in apic_desc.io_apics.iter().enumerate() {
-                    info!("Initializing IO APIC [{}]", i + 1);
+                    info!("Initializing IO APIC [{}]", i);
                     let mut io_apic = Self::create_io_apic(io_apic_desc);
 
                     // Initialize redirection table with regards to IRQ override entries
