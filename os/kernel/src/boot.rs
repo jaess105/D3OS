@@ -9,14 +9,16 @@
 */
 
 use crate::interrupt::interrupt_dispatcher;
-use crate::{naming, efi_services_available, init_persistent_allocator};
+use crate::{naming, efi_services_available, init_persistent_allocator, persistent_allocator};
 use crate::syscall::syscall_dispatcher;
 use crate::process::thread::Thread;
 use alloc::format;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::alloc::Layout;
 use core::ffi::c_void;
+use core::hash::Hasher;
 use core::mem::size_of;
 use core::ops::Deref;
 use core::ptr;
@@ -246,6 +248,21 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             let allocator = GlobalPersistentAllocator::new(nvram_base, nvram_size);
             info!("About to store allocator in global storage");
             init_persistent_allocator(allocator);
+
+            let mut allocator = persistent_allocator().write();
+            let pool = allocator.get_or_create_pool(b"test").unwrap();
+            match pool.transaction(|tx| {
+                let data = tx.allocate(Layout::from_size_align(32, 1).unwrap()).unwrap();
+
+                tx.modify(data, |data: &mut u64| {
+                    *data = 0x12345678;
+                })?;
+
+                Ok(())
+            }) {
+                Ok(_) => info!("Transaction successful"),
+                Err(_) => warn!("Transaction failed"),
+            }
 
         }
     }
