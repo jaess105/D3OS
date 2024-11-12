@@ -3,7 +3,7 @@
 extern crate alloc;
 
 use alloc::string::String;
-use persistent::{create_persistent_pool, perform_transaction, release_persistent_pool};
+use persistent::{create_persistent_pool};
 use terminal::read::read;
 use terminal::{print, println};
 #[allow(unused_imports)]
@@ -86,10 +86,10 @@ pub fn main() {
             }
             print!("\n");
             print!("Storing data in pool as : '{:#?}'\n", data.as_bytes());
-            match perform_transaction(&input, data.as_bytes()) {
-                Ok(_) => println!("Successfully stored data in pool"),
-                Err(e) => println!("Transaction failed: {}", e),
-            }
+            // match perform_transaction(&input, data.as_bytes()) {
+            //     Ok(_) => println!("Successfully stored data in pool"),
+            //     Err(e) => println!("Transaction failed: {}", e),
+            // }
         },
         Err(e) => println!("Failed to create/access pool: {}", e),
     }

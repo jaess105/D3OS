@@ -32,47 +32,47 @@ pub fn sys_release_persistent_pool(name_ptr: *const u8, name_len: usize) -> isiz
     }
 }
 
-pub fn sys_perform_transaction(
-    pool_name_ptr: *const u8,
-    pool_name_len: usize,
-    data_ptr: *const u8,
-    data_len: usize
-) -> isize {
-    if pool_name_ptr.is_null() || data_ptr.is_null() {
-        return -1;
-    }
-
-    let pool_name = unsafe { slice_from_raw_parts(pool_name_ptr, pool_name_len).as_ref().unwrap() };
-    let data = unsafe { slice_from_raw_parts(data_ptr, data_len).as_ref().unwrap() };
-
-    let mut allocator = persistent_allocator().write();
-
-    #[repr(C)]
-    #[derive(Copy, Clone)]
-    struct PoolData {
-        size: usize,
-        data: [u8; 32],//TODO:32 zeichen erlauben
-    }
-
-    match allocator.get_or_create_pool(pool_name) {
-        Some(pool) => {
-            match pool.transaction(|tx| {
-
-                let layout = Layout::new::<PoolData>();
-                // TODO: nur array bisher, je nach Zeit erweitern
-                let ptr = tx.allocate::<PoolData>(layout)?;
-
-                tx.modify(ptr, |pool_data| {
-                    pool_data.size = data_len;
-                    pool_data.data[..data_len].copy_from_slice(data);
-                })?;
-
-                Ok(())
-            }) {
-                Ok(_) => 0,
-                Err(_) => -1,
-            }
-        }
-        None => -2,
-    }
-}
+// pub fn sys_perform_transaction(
+//     pool_name_ptr: *const u8,
+//     pool_name_len: usize,
+//     data_ptr: *const u8,
+//     data_len: usize
+// ) -> isize {
+//     if pool_name_ptr.is_null() || data_ptr.is_null() {
+//         return -1;
+//     }
+//
+//     let pool_name = unsafe { slice_from_raw_parts(pool_name_ptr, pool_name_len).as_ref().unwrap() };
+//     let data = unsafe { slice_from_raw_parts(data_ptr, data_len).as_ref().unwrap() };
+//
+//     let mut allocator = persistent_allocator().write();
+//
+//     #[repr(C)]
+//     #[derive(Copy, Clone)]
+//     struct PoolData {
+//         size: usize,
+//         data: [u8; 32],//TODO:32 zeichen erlauben
+//     }
+//
+//     match allocator.get_or_create_pool(pool_name) {
+//         Some(pool) => {
+//             match pool.transaction(|tx| {
+//
+//                 let layout = Layout::new::<PoolData>();
+//                 // TODO: nur array bisher, je nach Zeit erweitern
+//                 let ptr = tx.allocate::<PoolData>(layout)?;
+//
+//                 tx.modify(ptr, |pool_data| {
+//                     pool_data.size = data_len;
+//                     pool_data.data[..data_len].copy_from_slice(data);
+//                 })?;
+//
+//                 Ok(())
+//             }) {
+//                 Ok(_) => 0,
+//                 Err(_) => -1,
+//             }
+//         }
+//         None => -2,
+//     }
+// }

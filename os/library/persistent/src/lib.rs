@@ -28,18 +28,18 @@ pub fn release_persistent_pool(name: &str) -> Result<(), &'static str> {
     }
 }
 
-pub fn perform_transaction(pool_name: &str, data: &[u8]) -> Result<(), &'static str> {
-    match syscall(
-        SystemCall::PerformTransaction,
-        &[
-            pool_name.as_ptr() as usize,
-            pool_name.len(),
-            data.as_ptr() as usize,
-            data.len(),
-            0,
-        ],
-    ) {
-        Ok(_) => Ok(()),
-        Err(_) => Err("Transaction failed"),
-    }
-}
+// pub fn perform_transaction(pool_name: &str, data: &[u8]) -> Result<(), &'static str> {
+//     match syscall(
+//         SystemCall::PerformTransaction,
+//         &[
+//             pool_name.as_ptr() as usize,
+//             pool_name.len(),
+//             data.as_ptr() as usize,
+//             data.len(),
+//             0,
+//         ],
+//     ) {
+//         Ok(_) => Ok(()),
+//         Err(_) => Err("Transaction failed"),
+//     }
+// }

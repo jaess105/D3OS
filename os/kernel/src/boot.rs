@@ -251,18 +251,9 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
 
             let mut allocator = persistent_allocator().write();
             let pool = allocator.get_or_create_pool(b"test").unwrap();
-            match pool.transaction(|tx| {
-                let data = tx.allocate(Layout::from_size_align(32, 1).unwrap()).unwrap();
+            //pool.allocate_with_id("data", 4660u64).expect("TODO: panic message");
 
-                tx.modify(data, |data: &mut u64| {
-                    *data = 0x12345678;
-                })?;
 
-                Ok(())
-            }) {
-                Ok(_) => info!("Transaction successful"),
-                Err(_) => warn!("Transaction failed"),
-            }
 
         }
     }
