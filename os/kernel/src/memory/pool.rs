@@ -7,8 +7,7 @@ use core::mem;
 use log::info;
 
 const POOL_MAGIC: u64 = 0x4433_4F53_504F4F4C; // "D3OS_POOL" in hex
-const MAX_JOURNAL_ENTRIES: usize = 64;
-const MAX_OBJECT_ENTRIES: usize = 63;//TODO: Gerade noch 63 weil passt in 4kb
+const MAX_OBJECT_ENTRIES: usize = 64;
 
 #[repr(u8)]
 #[derive(Debug, Copy, Clone)]
@@ -31,14 +30,6 @@ pub struct JournalEntry {
     checksum: u32,
 }
 
-#[repr(C)]
-#[derive(Debug)]
-pub struct Journal {
-    valid: AtomicBool,
-    generation: AtomicU32,
-    entries: [JournalEntry; MAX_JOURNAL_ENTRIES],
-    entry_count: AtomicUsize,
-}
 
 #[repr(C)]
 pub struct ObjectTableEntry {
@@ -50,8 +41,6 @@ pub struct ObjectTableEntry {
     data: Option<NonNull<u8>>, // Direct pointer to the allocated data
 }
 
-
-
 #[repr(C)]
 #[repr(C)]
 pub struct PoolHeader {
@@ -59,18 +48,13 @@ pub struct PoolHeader {
     size: usize,
     used_space: AtomicUsize,
 
-    // Size class management
-    small_blocks: [AtomicU64; 31], // Bitmap for blocks of sizes 64,128,...,1984
-    medium_blocks: AtomicU64,      // Bitmap for 2048 byte blocks
-    large_blocks: AtomicU64,       // Bitmap for 4096 byte blocks
+
 
     // Object table management
     object_table_offset: u64,
     max_objects: usize,
 
-    // Data area management
-    data_area_offset: u64,
-    data_area_size: usize,
+
 }
 
 #[derive(Debug)]
@@ -86,48 +70,13 @@ pub enum PoolError {
     JournalFull,
 }
 
-#[derive(Debug)]
-struct PoolLayout {
-    header_size: usize,
-    object_table_offset: usize,
-    max_objects: usize,
-    journal_offset: usize,
-    data_start: usize,
-}
-
 pub struct Pool {
-    base: u64,
+    base_address: u64,
     header: *mut PoolHeader,
+    object_table_offset: u64,
 }
 
 impl Pool {
-    fn calculate_pool_layout(total_size: usize) -> PoolLayout {
-        // Start with header size
-        let mut current_offset = mem::size_of::<PoolHeader>();
-        current_offset = align_up(current_offset, 64);
-
-        // Calculate how many objects we could potentially store
-        // Assuming minimum object size of 64 bytes
-        let data_space = total_size - current_offset;
-        let max_objects = data_space / 64;
-
-        // Calculate object table size
-        let object_table_size = max_objects * mem::size_of::<ObjectTableEntry>();
-        let object_table_offset = current_offset;
-        current_offset += object_table_size;
-        current_offset = align_up(current_offset, 64);
-
-        // Journal comes after object table
-        let journal_offset = current_offset;
-
-        PoolLayout {
-            header_size: mem::size_of::<PoolHeader>(),
-            object_table_offset,
-            max_objects,
-            journal_offset,
-            data_start: align_up(journal_offset + mem::size_of::<Journal>(), 64),
-        }
-    }
     pub fn new(base: u64, size: usize) -> Self {
         let header = base as *mut PoolHeader;
 
