@@ -250,7 +250,8 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             init_persistent_allocator(allocator);
 
             let mut allocator = persistent_allocator().write();
-            let pool = allocator.get_or_create_pool(b"test").unwrap();
+            let pool = allocator.get_or_create_pool(b"SIMON").unwrap();
+            pool.write_to_log();
             //pool.allocate_with_id("data", 4660u64).expect("TODO: panic message");
 
 

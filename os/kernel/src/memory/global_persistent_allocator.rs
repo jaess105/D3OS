@@ -8,7 +8,7 @@ use log::info;
 use x86_64::instructions::port::Port;
 
 const ALLOCATOR_MAGIC: u64 = 0x4433_4F53_4E56_4D4D; // "D3OS_NVMM"
-const FIXED_POOL_SIZE: usize = 1048576;// 1MB
+const FIXED_POOL_SIZE: usize = 1024*1024;// 1MB
 
 const BITS_PER_WORD: usize = 64;
 const METADATA_SIZE: usize = core::mem::size_of::<GlobalMetadata>();
