@@ -156,7 +156,7 @@ impl GlobalPersistentAllocator {
                     core::arch::x86_64::_mm_clflush(bitmap.add(i) as *const u8);
                 }
                 core::arch::x86_64::_mm_sfence();
-                allocator.print_metadata_debug_info();
+                //allocator.print_metadata_debug_info();
 
             } else {
                 info!("Found existing NVDIMM metadata, checking status");
@@ -312,6 +312,7 @@ impl GlobalPersistentAllocator {
                             _padding: [0; 8],
                         });
 
+
                         return true;
                     }
                 }
@@ -460,6 +461,17 @@ impl GlobalPersistentAllocator {
             info!("Total deallocations: {}",
                 (*self.metadata).total_deallocations.load(Ordering::Acquire));
             info!("==============================");
+        }
+    }
+
+    pub fn print_bitmap(&self) {
+        unsafe {
+            let total_pools = (*self.metadata).total_pools.load(Ordering::Acquire);
+            for i in 0..total_pools {
+                let used = self.is_bit_set(i as usize, true);
+                let initialized = self.is_bit_set(i as usize, false);
+                info!("Pool {}: initialized: {}, used: {}", i, initialized, used);
+            }
         }
     }
 }

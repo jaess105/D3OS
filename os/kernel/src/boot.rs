@@ -52,7 +52,7 @@ use crate::device::ps2::Keyboard;
 use crate::device::qemu_cfg;
 use crate::device::serial::SerialPort;
 use crate::memory::{MemorySpace, nvmem, PAGE_SIZE};
-use crate::memory::global_persistent_allocator::GlobalPersistentAllocator;
+use crate::memory::global_persistent_allocator::{GlobalPersistentAllocator, qemu_exit};
 use crate::memory::nvmem::Nfit;
 use crate::memory::r#virtual::page_table_index;
 use crate::network::rtl8139;
@@ -251,8 +251,42 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
 
             let mut allocator = persistent_allocator().write();
             let pool = allocator.get_or_create_pool(b"SIMON").unwrap();
-            pool.write_to_log();
-            //pool.allocate_with_id("data", 4660u64).expect("TODO: panic message");
+            // for i in 0..100 {
+            //     allocator.get_or_create_pool(format!("SIMON{}", i).as_bytes()).unwrap();
+            // }
+
+            #[derive(Copy, Clone)]
+            struct Person {
+                age: u32,
+                active: bool,
+                name: [u8; 5],
+            }
+
+            pool.transaction(|tx| {
+                //tx.allocate_with_id("data", 4660u64).expect("TODO: panic message");
+                //tx.allocate_with_id("data", 48879u64)?;
+                tx.allocate_with_id("data", 45054u64)?;
+                // Debug print after modification
+
+                // tx.allocate_with_id("person1", Person {
+                //     name: *b"Simon",
+                //     age: 25,
+                //     active: false,
+                // }).expect("TODO: panic message");
+
+                //tx.allocate_with_id("data1", 1234u64)?;
+                qemu_exit(123);
+                Ok(())
+            }).expect("TODO: panic message");
+
+            // pool.transaction(|tx| {
+            //     tx.allocate_with_id("data", 48879u64).expect("TODO: panic message");
+            //
+            //
+            //     let mydata = tx.get_by_id::<u64>("data")?;
+            //
+            //     Ok(())
+            // }).expect("TODO: panic message");
 
 
 

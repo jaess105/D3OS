@@ -1,15 +1,15 @@
-use core::array;
+use core::alloc::Layout;
 use core::any::{TypeId, type_name};
+use core::array;
+use core::mem;
 use core::ptr;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use core::mem;
 use linked_list_allocator::LockedHeap;
 use log::info;
 
-
 const POOL_MAGIC: u64 = 0x4433_4F53_504F4F4C; // "D3OS_POOL" in hex
-const  MAX_OBJECT_ENTRIES: usize = 64;
+const MAX_OBJECT_ENTRIES: usize = 64;
 
 #[repr(u8)]
 #[derive(Debug, Copy, Clone)]
@@ -20,18 +20,18 @@ pub enum Operation {
     ObjectTableUpdate = 4,
 }
 
+//TODO: Only for modification
 #[repr(C)]
 #[derive(Debug)]
 pub struct UndoLog {
     valid: AtomicBool,
     operation: Operation,
-    offset: u64,
+    offset: u64,// Ref to the objectTableEntry
     size: usize,
     type_hash: u64,
     checksum: u32,
     old_data: [u8; 4096],
 }
-
 
 #[repr(C)]
 pub struct ObjectTableEntry {
@@ -43,7 +43,6 @@ pub struct ObjectTableEntry {
     data: Option<NonNull<u8>>, // Direct pointer to the allocated data
 }
 
-#[repr(C)]
 #[repr(C)]
 pub struct PoolHeader {
     magic: u64,
@@ -90,7 +89,7 @@ impl Pool {
 
         unsafe {
             ptr::write(header, PoolHeader {
-                magic: POOL_MAGIC,
+                magic: POOL_MAGIC,//TODO: only for debug
                 size,
                 max_objects: MAX_OBJECT_ENTRIES,
                 object_table_offset,
@@ -118,66 +117,82 @@ impl Pool {
 
         pool.print_metadata_debug_info();
         pool
-
     }
 
-    pub fn write_to_log(&self) {
+    // Transaction handling
+    pub fn transaction<F, R>(&mut self, f: F) -> Result<R, PoolError>
+    where
+        F: FnOnce(&mut TransactionContext) -> Result<R, PoolError>,
+    {
         unsafe {
-            let ptr = &*self.header;
-            let ptr = ptr.journal_entry_offset;
+            // Start transaction by initializing the log
+            let log = &mut *((*self.header).journal_entry_offset as *mut UndoLog);
+            log.valid.store(true, Ordering::Release);
+            Self::flush_cache_line(log as *const _ as *const u8);
 
-            let log = ptr as *mut UndoLog;
+            // Create transaction context
+            let mut ctx = TransactionContext { pool: self };
 
-            info!("Writing to log at 0x{:x}", log as u64);
+            // Execute transaction
+            match f(&mut ctx) {
+                Ok(result) => {
+                    // Mark transaction as complete
+                    log.valid.store(false, Ordering::Release);
+                    Self::flush_cache_line(log as *const _ as *const u8);
+                    Ok(result)
+                }
+                Err(e) => {
+                    // Roll back changes
+                    self.rollback_log(log)?;
+                    Err(e)
+                }
+            }
+        }
+    }
 
-            ptr::write(log, UndoLog {
-                valid: AtomicBool::new(true),
-                operation: Operation::Allocation,
-                offset: 0,
-                size: 1234,
-                type_hash: 0,
-                checksum: 0,
-                old_data: [0; 4096],
-            });
+    fn rollback_log(&mut self, log: &mut UndoLog) -> Result<(), PoolError> {
+        if !log.valid.load(Ordering::Acquire) {
+            return Ok(());
+        }
 
+        unsafe {
+            match log.operation {
+                Operation::Modification => {
+                    // Restore old data
+                    ptr::copy_nonoverlapping(
+                        log.old_data.as_ptr(),
+                        log.offset as *mut u8,
+                        log.size
+                    );
+                    Self::flush_cache_line(log.offset as *const u8);
+                }
+                Operation::Allocation => {
+                    // Free allocated memory
+                    if let Some(ptr) = NonNull::new(log.offset as *mut u8) {
+                        self.heap.lock().deallocate(ptr, Layout::from_size_align(log.size, 1).unwrap());//TODO: check alignment
+                    }
+                }
+                //TODO: Macht für mich noch keinen Sinn!
+                Operation::ObjectTableUpdate => {
+                    // Restore old object table entry
+                    let entry = log.offset as *mut ObjectTableEntry;
+                    ptr::copy_nonoverlapping(
+                        log.old_data.as_ptr(),
+                        entry as *mut u8,
+                        mem::size_of::<ObjectTableEntry>()
+                    );
+                    Self::flush_cache_line(entry as *const u8);
+                }
+                _ => {}
+            }
 
+            log.valid.store(false, Ordering::Release);
+            Self::flush_cache_line(log as *const _ as *const u8);
+            Ok(())
         }
     }
 
 
-
-    // Transaction handling
-    // pub fn transaction<F, R>(&mut self, f: F) -> Result<R, PoolError>
-    // where
-    //     F: FnOnce(&mut TransactionContext) -> Result<R, PoolError>,
-    // {
-    //     unsafe {
-    //         let header = &mut *self.header;
-    //         let journal = &mut *self.get_journal();
-    //
-    //         // Start new transaction
-    //         journal.entry_count.store(0, Ordering::Release);
-    //         journal.valid.store(true, Ordering::Release);
-    //         journal.generation.fetch_add(1, Ordering::AcqRel);
-    //         Self::flush_cache_line(journal as *const _ as *const u8);
-    //
-    //         let mut context = TransactionContext { pool: self };
-    //
-    //         match f(&mut context) {
-    //             Ok(result) => {
-    //                 // Mark transaction as complete
-    //                 journal.valid.store(false, Ordering::Release);
-    //                 Self::flush_cache_line(journal as *const _ as *const u8);
-    //                 Ok(result)
-    //             }
-    //             Err(e) => {
-    //                 // Rollback transaction
-    //                 self.rollback_journal(journal)?;
-    //                 Err(e)
-    //             }
-    //         }
-    //     }
-    // }
     //
     // // Object allocation and management
     // pub fn allocate_with_id<T: Copy + 'static>(&mut self, id: &str, data: T) -> Result<(), PoolError> {
@@ -185,42 +200,6 @@ impl Pool {
     //         ctx.allocate_with_id(id, data)
     //     })
     // }
-    //
-    // pub fn get_by_id<T: Copy + 'static>(&self, id: &str) -> Result<T, PoolError> {
-    //     unsafe {
-    //         let header = &*self.header;
-    //         let table = &*self.get_object_table();
-    //
-    //         for i in 0..table.count.load(Ordering::Acquire) {
-    //             let entry = &table.entries[i];
-    //             if !entry.valid.load(Ordering::Acquire) {
-    //                 continue;
-    //             }
-    //
-    //             let entry_id = core::str::from_utf8_unchecked(
-    //                 &entry.id[..entry.id_len as usize]
-    //             );
-    //
-    //             if entry_id == id {
-    //                 // Verify type
-    //                 let expected_hash = Self::compute_type_hash::<T>();
-    //                 if entry.type_hash != expected_hash {
-    //                     return Err(PoolError::TypeMismatch {
-    //                         expected: type_name::<T>(),
-    //                         actual: "unknown",
-    //                     });
-    //                 }
-    //
-    //                 // Read data
-    //                 let ptr = entry.offset as *const T;
-    //                 return Ok(ptr.read());
-    //             }
-    //         }
-    //
-    //         Err(PoolError::InvalidId)
-    //     }
-    // }
-    //
     // pub fn modify_data<T: Copy + 'static>(&mut self, id: &str, f: impl FnOnce(&mut T)) -> Result<(), PoolError> {
     //     self.transaction(|ctx| {
     //         let data_ptr = ctx.get_by_id::<T>(id)?;
@@ -242,52 +221,6 @@ impl Pool {
     //         Ok(())
     //     }
     // }
-    //
-    // // Internal helpers
-    // fn rollback_journal(&mut self, journal: &mut Journal) -> Result<(), PoolError> {
-    //     unsafe {
-    //         let count = journal.entry_count.load(Ordering::Acquire);
-    //
-    //         for i in (0..count).rev() {
-    //             let entry = &journal.entries[i];
-    //             if !entry.valid.load(Ordering::Acquire) {
-    //                 continue;
-    //             }
-    //
-    //             match entry.operation {
-    //                 Operation::Modification => {
-    //                     // Restore old data
-    //                     ptr::copy_nonoverlapping(
-    //                         entry.old_data.as_ptr(),
-    //                         entry.offset as *mut u8,
-    //                         entry.size
-    //                     );
-    //                     Self::flush_cache_line(entry.offset as *const u8);
-    //                 }
-    //                 Operation::Allocation => {
-    //                     // Free allocated block
-    //                     self.free_block(entry.offset, entry.size)?;
-    //                 }
-    //                 Operation::ObjectTableUpdate => {
-    //                     let table = &mut *self.get_object_table();
-    //                     let entry_ptr = entry.offset as *mut ObjectTableEntry;
-    //                     ptr::copy_nonoverlapping(
-    //                         entry.old_data.as_ptr(),
-    //                         entry_ptr as *mut u8,
-    //                         core::mem::size_of::<ObjectTableEntry>()
-    //                     );
-    //                     Self::flush_cache_line(entry_ptr as *const u8);
-    //                 }
-    //                 _ => {}
-    //             }
-    //         }
-    //
-    //         journal.valid.store(false, Ordering::Release);
-    //         Self::flush_cache_line(journal as *const _ as *const u8);
-    //         Ok(())
-    //     }
-    // }
-    //
     //
 
     fn compute_type_hash<T: 'static>() -> u64 {
@@ -325,199 +258,237 @@ impl Pool {
             info!("  - Used space: {} bytes", header.used_space.load(Ordering::Acquire));
         }
     }
+
+    pub fn detailed_log_dump(&self) {
+        unsafe {
+            let log = &*((*self.header).journal_entry_offset as *mut UndoLog);
+            let log_addr = (*self.header).journal_entry_offset;
+
+            info!("=== Detailed Log Structure Dump ===");
+            info!("Base Address: 0x{:x}", log_addr);
+            info!("Offset  Content                 Interpretation");
+            info!("-------------------------------------------");
+
+            // Print each field with its offset and raw bytes
+            info!("+0x00: {:016x}  Valid: {}",
+                  *(log_addr as *const u64),
+                  log.valid.load(Ordering::Acquire));
+
+            info!("+0x08: {:02x}               Operation: {:?}",
+                  log.operation as u8,
+                  log.operation);
+
+            info!("+0x10: {:016x}  Offset: 0x{:x}",
+                  log.offset,
+                  log.offset);
+
+            info!("+0x18: {:016x}  Size: {} bytes",
+                  log.size as u64,
+                  log.size);
+
+            info!("+0x20: {:016x}  Type Hash: 0x{:x}",
+                  log.type_hash,
+                  log.type_hash);
+
+            info!("Old Data:");
+            for i in 0..log.size.min(32) {
+                if i % 16 == 0 {
+                    print!("\n+0x{:02x}: ", 0x30 + i);
+                }
+                print!("{:02x} ", log.old_data[i]);
+            }
+            info!("");
+        }
+    }
+
+    pub fn debug_print_object_table(&self) {
+        unsafe {
+            let table_base = (self.base_address + (*self.header).object_table_offset)
+                as *const ObjectTableEntry;
+
+            info!("=== Object Table Debug Information ===");
+            info!("Object Table Location: 0x{:x}", table_base as u64);
+
+            for i in 0..MAX_OBJECT_ENTRIES {
+                let entry = &*table_base.add(i);
+                if entry.valid.load(Ordering::Acquire) {
+                    let id_str = core::str::from_utf8_unchecked(&entry.id[..entry.id_len as usize]);
+                    info!("Entry #{}", i);
+                    info!("  ID: {}", id_str);
+                    info!("  Type Hash: 0x{:x}", entry.type_hash);
+                    info!("  Type Size: {} bytes", entry.type_size);
+                    info!("  Data Pointer: {:?}", entry.data);
+                }
+            }
+        }
+    }
 }
 
 pub struct TransactionContext<'a> {
     pool: &'a mut Pool,
 }
 
-// impl<'a> TransactionContext<'a> {
-//     pub fn allocate_with_id<T: Copy + 'static>(&mut self, id: &str, data: T) -> Result<(), PoolError> {
-//         unsafe {
-//             let size = mem::size_of::<T>();
-//             let ptr = self.allocate_block(size)?;
-//
-//             // Journal the allocation
-//             let journal = &mut *self.pool.get_journal();
-//             let idx = journal.entry_count.fetch_add(1, Ordering::AcqRel);
-//
-//             if idx >= MAX_JOURNAL_ENTRIES {
-//                 return Err(PoolError::JournalFull);
-//             }
-//
-//             let entry = &mut journal.entries[idx];
-//             entry.valid.store(true, Ordering::Release);
-//             entry.operation = Operation::Allocation;
-//             entry.offset = ptr as u64;
-//             entry.size = size;
-//             entry.type_hash = Pool::compute_type_hash::<T>();
-//
-//             Pool::flush_cache_line(entry as *const _ as *const u8);
-//
-//             // Write data
-//             ptr::write(ptr as *mut T, data);
-//             Pool::flush_cache_line(ptr as *const u8);
-//
-//             // Update object table
-//             let table = &mut *self.pool.get_object_table();
-//             let count = table.count.fetch_add(1, Ordering::AcqRel);
-//
-//             if count >= MAX_OBJECT_ENTRIES {
-//                 return Err(PoolError::ObjectTableFull);
-//             }
-//
-//             let table_entry = &mut table.entries[count];
-//
-//             // Journal object table update
-//             let idx = journal.entry_count.fetch_add(1, Ordering::AcqRel);
-//             let journal_entry = &mut journal.entries[idx];
-//
-//             journal_entry.valid.store(true, Ordering::Release);
-//             journal_entry.operation = Operation::ObjectTableUpdate;
-//             journal_entry.offset = table_entry as *mut _ as u64;
-//
-//             // Backup old entry
-//             ptr::copy_nonoverlapping(
-//                 table_entry as *const _ as *const u8,
-//                 journal_entry.old_data.as_mut_ptr(),
-//                 mem::size_of::<ObjectTableEntry>()
-//             );
-//
-//             // Update entry
-//             table_entry.valid.store(true, Ordering::Release);
-//             table_entry.offset = ptr as u64;
-//             table_entry.size = size;
-//             table_entry.type_hash = Pool::compute_type_hash::<T>();
-//
-//             let id_bytes = id.as_bytes();
-//             if id_bytes.len() > 55 {
-//                 return Err(PoolError::InvalidId);
-//             }
-//
-//             table_entry.id[..id_bytes.len()].copy_from_slice(id_bytes);
-//             table_entry.id_len = id_bytes.len() as u8;
-//
-//             Pool::flush_cache_line(table_entry as *const _ as *const u8);
-//
-//             Ok(())
-//         }
-//     }
-//
-//     pub fn get_by_id<T: Copy + 'static>(&self, id: &str) -> Result<NonNull<T>, PoolError> {
-//         unsafe {
-//             let header = &*self.pool.header;
-//             let table = &*self.pool.get_object_table();
-//
-//             for i in 0..table.count.load(Ordering::Acquire) {
-//                 let entry = &table.entries[i];
-//                 if !entry.valid.load(Ordering::Acquire) {
-//                     continue;
-//                 }
-//
-//                 let entry_id = core::str::from_utf8_unchecked(
-//                     &entry.id[..entry.id_len as usize]
-//                 );
-//
-//                 if entry_id == id {
-//                     // Verify type
-//                     let expected_hash = Pool::compute_type_hash::<T>();
-//                     if entry.type_hash != expected_hash {
-//                         return Err(PoolError::TypeMismatch {
-//                             expected: type_name::<T>(),
-//                             actual: "unknown",
-//                         });
-//                     }
-//
-//                     return Ok(NonNull::new_unchecked(entry.offset as *mut T));
-//                 }
-//             }
-//
-//             Err(PoolError::InvalidId)
-//         }
-//     }
-//
-//     pub fn modify<T: Copy>(
-//         &mut self,
-//         mut ptr: NonNull<T>,
-//         f: impl FnOnce(&mut T),
-//     ) -> Result<(), PoolError> {
-//         unsafe {
-//             let journal = &mut *self.pool.get_journal();
-//             let idx = journal.entry_count.fetch_add(1, Ordering::AcqRel);
-//
-//             if idx >= MAX_JOURNAL_ENTRIES {
-//                 return Err(PoolError::JournalFull);
-//             }
-//
-//             let entry = &mut journal.entries[idx];
-//             entry.valid.store(true, Ordering::Release);
-//             entry.operation = Operation::Modification;
-//             entry.offset = ptr.as_ptr() as u64;
-//             entry.size = mem::size_of::<T>();
-//
-//             // Backup old data
-//             ptr::copy_nonoverlapping(
-//                 ptr.as_ptr() as *const u8,
-//                 entry.old_data.as_mut_ptr(),
-//                 mem::size_of::<T>()
-//             );
-//
-//             Pool::flush_cache_line(entry as *const _ as *const u8);
-//
-//             // Modify data
-//             f(ptr.as_mut());
-//             Pool::flush_cache_line(ptr.as_ptr() as *const u8);
-//
-//             Ok(())
-//         }
-//     }
-//
-//     fn allocate_block(&mut self, size: usize) -> Result<*mut u8, PoolError> {
-//         unsafe {
-//             let header = &mut *self.pool.header;
-//
-//             let (ptr, _) = if size <= 1984 {
-//                 let class = (size - 1) / 64;
-//                 let bitmap = &header.small_blocks[class];
-//                 self.find_free_block(bitmap, class, 64)
-//             } else if size <= 2048 {
-//                 self.find_free_block(&header.medium_blocks, 0, 2048)
-//             } else if size <= 4096 {
-//                 self.find_free_block(&header.large_blocks, 0, 4096)
-//             } else {
-//                 return Err(PoolError::AllocationFailed);
-//             }?;
-//
-//             Ok(ptr)
-//         }
-//     }
-//
-//     fn find_free_block(
-//         &self,
-//         bitmap: &AtomicU64,
-//         class: usize,
-//         block_size: usize,
-//     ) -> Result<(*mut u8, usize), PoolError> {
-//         let bits = bitmap.load(Ordering::Acquire);
-//         let pos = (!bits).trailing_zeros() as usize;
-//
-//         if pos >= 64 {
-//             return Err(PoolError::AllocationFailed);
-//         }
-//
-//         bitmap.fetch_or(1 << pos, Ordering::Release);
-//
-//         let offset = if block_size <= 64 {
-//             self.pool.base as usize + (class * 64 * 64) + (pos * block_size)
-//         } else if block_size == 2048 {
-//             self.pool.base as usize + (31 * 64 * 64) + (pos * block_size)
-//         } else {
-//             self.pool.base as usize + (31 * 64 * 64) + (64 * 2048) + (pos * block_size)
-//         };
-//
-//         Ok((offset as *mut u8, pos))
-//     }
-// }
+impl<'a> TransactionContext<'a> {
+
+    pub fn allocate_with_id<T: Copy + 'static>(&mut self, id: &str, data: T) -> Result<(), PoolError> {
+        if id.len() > 55 {
+            return Err(PoolError::InvalidId);
+        }
+
+        if let Ok(ptr) = self.get_by_id::<T>(id) {
+            // If it exists, modify it
+            info!("Object with ID '{}' already exists, modifying...", id);
+            self.modify(ptr, |existing| *existing = data)?;
+            return Ok(());
+        }
+
+        unsafe {
+            // Allocate memory for the object
+            let layout = Layout::new::<T>();
+            let ptr = self.pool.heap.lock()
+                .allocate_first_fit(layout)
+                .map_err(|_| PoolError::AllocationFailed)?;
+
+            // Log the allocation
+            let log = &mut *((*self.pool.header).journal_entry_offset as *mut UndoLog);
+            log.operation = Operation::Allocation;
+            log.offset = ptr.as_ptr() as u64;
+            log.size = layout.size();
+            log.type_hash = Pool::compute_type_hash::<T>();
+            Pool::flush_cache_line(log as *const _ as *const u8);
+
+            //TODO: hier debug
+            info!("=== After Allocation info ===");
+            self.pool.detailed_log_dump();
+
+            // Write the data
+            ptr::write(ptr.as_ptr() as *mut T, data);
+            Pool::flush_cache_line(ptr.as_ptr() as *const u8);
+
+            // Find free entry in object table
+            let table_base = (self.pool.base_address + (*self.pool.header).object_table_offset)
+                as *mut ObjectTableEntry;
+            let mut free_entry = None;
+
+            for i in 0..MAX_OBJECT_ENTRIES {
+                let entry = &mut *table_base.add(i);
+                if !entry.valid.load(Ordering::Acquire) {
+                    free_entry = Some(entry);
+                    break;
+                }
+            }
+
+            let entry = free_entry.ok_or(PoolError::ObjectTableFull)?;
+
+            // Log object table update
+            log.operation = Operation::ObjectTableUpdate;
+            log.offset = entry as *mut _ as u64;
+            ptr::copy_nonoverlapping(
+                entry as *const ObjectTableEntry as *const u8,
+                log.old_data.as_mut_ptr(),
+                mem::size_of::<ObjectTableEntry>()
+            );
+            Pool::flush_cache_line(log as *const _ as *const u8);
+
+            //TODO: hier debug
+            info!("");
+            info!("=== Object Table info logged ===");
+            info!("");
+            self.pool.detailed_log_dump();
+
+            // Update object table entry
+            let id_bytes = id.as_bytes();
+            if id_bytes.len() > 55 {
+                return Err(PoolError::InvalidId);
+            }
+
+            entry.valid.store(true, Ordering::Release);
+            entry.id[..id_bytes.len()].copy_from_slice(id_bytes);
+            entry.id_len = id_bytes.len() as u8;
+            entry.type_hash = Pool::compute_type_hash::<T>();
+            entry.type_size = mem::size_of::<T>();
+            entry.data = Some(ptr);
+
+            Pool::flush_cache_line(entry as *const _ as *const u8);
+
+            //TODO: hier debug
+            //info!("=== Final info ===");
+            //self.pool.debug_print_object_table();
+
+            Ok(())
+        }
+    }
+
+    pub fn get_by_id<T: Copy + 'static>(&self, id: &str) -> Result<NonNull<T>, PoolError> {
+        unsafe {
+            let table_base = (self.pool.base_address + (*self.pool.header).object_table_offset)
+                as *const ObjectTableEntry;
+
+            for i in 0..MAX_OBJECT_ENTRIES {
+                let entry = &*table_base.add(i);
+                if entry.valid.load(Ordering::Acquire) {
+                    let entry_id = core::str::from_utf8_unchecked(
+                        &entry.id[..entry.id_len as usize]
+                    );
+
+                    if entry_id == id {
+                        // Verify type
+                        let expected_hash = Pool::compute_type_hash::<T>();
+                        if entry.type_hash != expected_hash {
+                            return Err(PoolError::TypeMismatch {
+                                expected: type_name::<T>(),
+                                actual: "unknown",
+                            });
+                        }
+
+                        return Ok(NonNull::new_unchecked(entry.data.unwrap().as_ptr() as *mut T));
+                    }
+                }
+            }
+
+            Err(PoolError::InvalidId)
+        }
+    }
+
+    pub fn read_by_id<T: Copy + 'static>(&self, id: &str) -> Result<T, PoolError> {
+        let ptr = self.get_by_id::<T>(id)?;
+        unsafe {
+            Ok(*ptr.as_ref())
+        }
+    }
+
+    pub fn modify<T: Copy>(
+        &mut self,
+        ptr: NonNull<T>,
+        f: impl FnOnce(&mut T),
+    ) -> Result<(), PoolError> {
+        unsafe {
+            // Log the modification
+            let log = &mut *((*self.pool.header).journal_entry_offset as *mut UndoLog);
+            log.operation = Operation::Modification;
+            log.offset = ptr.as_ptr() as u64;
+            log.size = mem::size_of::<T>();
+
+            // Backup old data
+            ptr::copy_nonoverlapping(
+                ptr.as_ptr() as *const u8,
+                log.old_data.as_mut_ptr(),
+                mem::size_of::<T>()
+            );
+            Pool::flush_cache_line(log as *const _ as *const u8);
+
+            //TODO: hier debug
+            info!("=== LogModification info ===");
+            self.pool.detailed_log_dump();
+
+            // Modify data
+            f(&mut *ptr.as_ptr());
+            Pool::flush_cache_line(ptr.as_ptr() as *const u8);
+
+            Ok(())
+        }
+    }
+}
 
 fn align_up(addr: usize, align: usize) -> usize {
     (addr + align - 1) & !(align - 1)
