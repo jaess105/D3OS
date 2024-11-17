@@ -17,6 +17,7 @@ use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::alloc::Layout;
+use core::arch::x86_64::_rdtsc;
 use core::ffi::c_void;
 use core::hash::Hasher;
 use core::mem::size_of;
@@ -54,6 +55,7 @@ use crate::device::serial::SerialPort;
 use crate::memory::{MemorySpace, nvmem, PAGE_SIZE};
 use crate::memory::global_persistent_allocator::{GlobalPersistentAllocator, qemu_exit};
 use crate::memory::nvmem::Nfit;
+use crate::memory::pool::{Pool, PoolError};
 use crate::memory::r#virtual::page_table_index;
 use crate::network::rtl8139;
 
@@ -251,44 +253,71 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
 
             let mut allocator = persistent_allocator().write();
             let pool = allocator.get_or_create_pool(b"SIMON").unwrap();
-            // for i in 0..100 {
-            //     allocator.get_or_create_pool(format!("SIMON{}", i).as_bytes()).unwrap();
-            // }
 
-            #[derive(Copy, Clone)]
-            struct Person {
-                age: u32,
-                active: bool,
-                name: [u8; 5],
+            //NEW TEST
+
+            pool.debug_print_object_table();
+
+            //measure_performance(pool);
+            //test_recovery_scenarios(pool);
+
+            match pool.transaction(|tx| {
+                //let leckei= tx.get_by_id::<u64>("recover_test")?;
+                tx.deallocate_by_id("recover_test")?;
+                Ok(())
+            }) {
+                Ok(_) => info!("Transaction successful"),
+                Err(e) => info!("Transaction failed: {:?}", e),
             }
 
-            pool.transaction(|tx| {
-                //tx.allocate_with_id("data", 4660u64).expect("TODO: panic message");
-                //tx.allocate_with_id("data", 48879u64)?;
-                tx.allocate_with_id("data", 45054u64)?;
-                // Debug print after modification
 
-                // tx.allocate_with_id("person1", Person {
-                //     name: *b"Simon",
-                //     age: 25,
-                //     active: false,
-                // }).expect("TODO: panic message");
 
-                //tx.allocate_with_id("data1", 1234u64)?;
-                qemu_exit(123);
-                Ok(())
-            }).expect("TODO: panic message");
 
+            //OLD STUFF
+            // #[derive(Copy, Clone)]
+            // struct Person {
+            //     age: u32,
+            //     active: bool,
+            //     name: [u8; 5],
+            // }
+            //
+            // //datastuct with 1 mb size
+            // #[derive(Copy, Clone)]
+            // struct Data {
+            //     data: [u8; (1024 * 1024)/2],
+            // }
+            //
             // pool.transaction(|tx| {
-            //     tx.allocate_with_id("data", 48879u64).expect("TODO: panic message");
+            //     //tx.allocate_with_id("data", 4660u64).expect("TODO: panic message");
+            //     //tx.allocate_with_id("data", 48879u64)?;
+            //     //tx.allocate_with_id("data", 45054u64)?;
+            //     info!("About to allocate 1mb");
+            //     //Allocate 1 mb
+            //     //tx.allocate_with_id("1mb", ).expect("TODO: panic message");
             //
+            //     // Debug print after modification
             //
-            //     let mydata = tx.get_by_id::<u64>("data")?;
+            //     // tx.allocate_with_id("person1", Person {
+            //     //     name: *b"Simon",
+            //     //     age: 25,
+            //     //     active: false,
+            //     // }).expect("TODO: panic message");
             //
+            //     //tx.allocate_with_id("data1", 1234u64)?;
+            //     //qemu_exit(123);
             //     Ok(())
             // }).expect("TODO: panic message");
-
-
+            //
+            // // pool.transaction(|tx| {
+            // //     tx.allocate_with_id("data", 48879u64).expect("TODO: panic message");
+            // //
+            // //
+            // //     let mydata = tx.get_by_id::<u64>("data")?;
+            // //
+            // //     Ok(())
+            // // }).expect("TODO: panic message");
+            //
+            // allocator.get_or_create_pool(b"SIMON2").unwrap();
 
         }
     }
@@ -516,4 +545,182 @@ fn unprotect_frame(frame: PhysFrame, root_level: usize) {
         page_table = unsafe { (entry.addr().as_u64() as *mut PageTable).as_mut().unwrap() };
         level -= 1;
     }
+}
+
+#[derive(Copy, Clone)]
+struct SmallObject {
+    id: u32,
+    active: bool,
+}
+
+#[derive(Copy, Clone)]
+struct MediumObject {
+    id: u64,
+    name: [u8; 32],
+    data: [u8; 256],
+}
+
+#[derive(Copy, Clone)]
+struct LargeObject {
+    id: u64,
+    data: [u8; 1024 * 4], // 4KB
+}
+
+// Test Scenarios
+fn test_single_pool(allocator: &mut GlobalPersistentAllocator) {
+    info!("=== Testing Single Pool Operations ===");
+    let pool = allocator.get_or_create_pool(b"TEST_POOL").unwrap();
+
+    // 1. Basic Operations
+    info!("Test 1: Basic Operations");
+    pool.transaction(|tx| {
+        tx.allocate_with_id("small1", SmallObject { id: 1, active: true })?;
+        tx.allocate_with_id("medium1", MediumObject {
+            id: 1,
+            name: *b"TestObject\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+            data: [0; 256],
+        })?;
+        Ok(())
+    }).expect("Basic operations test failed");
+
+    // 2. Transaction Atomicity
+    info!("Test 2: Transaction Atomicity");
+    pool.transaction(|tx| {
+        tx.allocate_with_id("atomic1", 42u64)?;
+        tx.allocate_with_id("atomic2", 84u64)?;
+
+        let ptr = tx.get_by_id::<u64>("atomic1")?;
+        tx.modify(ptr, |n| *n += 1)?;
+        Ok(())
+    }).expect("Atomicity test failed");
+
+    // Print results
+    //pool.debug_print_object_table();
+}
+
+fn test_multiple_pools(allocator: &mut GlobalPersistentAllocator) {
+    info!("=== Testing Multiple Pools ===");
+
+    // Test Pool 1
+    {
+        let pool1 = allocator.get_or_create_pool(b"POOL1").unwrap();
+        pool1.transaction(|tx| {
+            tx.allocate_with_id("pool1_data", 42u64)?;
+            Ok(())
+        }).expect("Pool 1 test failed");
+    }
+
+    // Test Pool 2
+    {
+        let pool2 = allocator.get_or_create_pool(b"POOL2").unwrap();
+        pool2.transaction(|tx| {
+            tx.allocate_with_id("pool2_data", 84u64)?;
+            Ok(())
+        }).expect("Pool 2 test failed");
+    }
+}
+
+fn test_memory_pressure(allocator: &mut GlobalPersistentAllocator) {
+    info!("=== Testing Memory Pressure ===");
+    let pool = allocator.get_or_create_pool(b"PRESSURE_TEST").unwrap();
+
+    pool.transaction(|tx| {
+        for i in 0..10 {
+            tx.allocate_with_id(
+                &format!("large{}", i),
+                LargeObject { id: i as u64, data: [i as u8; 1024 * 4] }
+            )?;
+        }
+        Ok(())
+    }).expect("Memory pressure test failed");
+
+    pool.debug_print_object_table();
+}
+
+fn test_type_safety(allocator: &mut GlobalPersistentAllocator) {
+    info!("=== Testing Type Safety ===");
+    let pool = allocator.get_or_create_pool(b"TYPE_SAFETY").unwrap();
+
+    pool.transaction(|tx| {
+        tx.allocate_with_id("type_test", 42u64)?;
+
+        // This should fail with type mismatch
+        match tx.get_by_id::<u32>("type_test") {
+            Err(PoolError::TypeMismatch { .. }) => info!("Type safety check passed"),
+            _ => panic!("Type safety check failed"),
+        }
+        Ok(())
+    }).expect("Type safety test failed");
+}
+
+// Main test runner
+fn run_all_tests(allocator: &mut GlobalPersistentAllocator) {
+    test_single_pool(allocator);
+    test_multiple_pools(allocator);
+    test_memory_pressure(allocator);
+    test_type_safety(allocator);
+
+    info!("All tests completed successfully!");
+}
+
+// Additional Test Scenarios for Thesis Analysis:
+
+// 1. Performance Measurement
+fn measure_performance(pool: &mut Pool) {
+
+    let start = unsafe { _rdtsc() };
+
+    pool.transaction(|tx| {
+        for i in 0..1000 {
+            tx.allocate_with_id(&format!("perf{}", i), i as u64)?;
+        }
+        Ok(())
+    }).expect("Performance test failed");
+
+    let end  = unsafe { _rdtsc() };
+
+    info!("Performance Test: {} operations in {} ns", 1000, tsc_to_ns(end-start));
+
+    // Print detailed memory statistics
+    //pool.debug_print_object_table();
+}
+
+// TODO: RECOVERY TEST
+// 2. Recovery Scenarios
+fn test_recovery_scenarios(pool: &mut Pool) {
+    // Test incomplete transaction recovery
+    pool.transaction(|tx| {
+        tx.allocate_with_id("recover_test", 42u64)?;
+        // Simulate different crash points
+        qemu_exit(123);
+        Ok(())
+    }).expect("Recovery scenario failed");
+}
+
+// 3. Memory Utilization Analysis
+fn analyze_memory_utilization(pool: &mut Pool) {
+    pool.transaction(|tx| {
+        // Allocate different sized objects
+        tx.allocate_with_id("small", SmallObject { id: 1, active: true })?;
+        tx.allocate_with_id("medium", MediumObject {
+            id: 1,
+            name: [0; 32],
+            data: [0; 256],
+        })?;
+        tx.allocate_with_id("large", LargeObject {
+            id: 1,
+            data: [0; 1024 * 4],
+        })?;
+        Ok(())
+    }).expect("Memory utilization test failed");
+
+    // Print detailed memory statistics
+    //pool.debug_print_object_table();
+}
+
+fn tsc_to_ns(tsc_ticks: u64) -> u64 {
+    // CPU frequency in Hz (2.4 GHz)
+    const CPU_FREQUENCY_HZ: u64 = 2_400_000_000;
+
+    (tsc_ticks * 1_000_000_000) / CPU_FREQUENCY_HZ
 }
