@@ -217,68 +217,74 @@ impl GlobalPersistentAllocator {
             return None;
         }
 
-        let total_pools = unsafe { (*self.metadata).total_pools.load(Ordering::Acquire) };
+        unsafe {
+            let total_pools = (*self.metadata).total_pools.load(Ordering::Acquire);
+            let mut first_free_slot = None;
 
-        // First try to find existing pool
-        for i in 0..total_pools {
-            if self.is_bit_set(i as usize, true) {
-                unsafe {
-                    let entry = &mut *self.pool_directory.add(i as usize);
+            // Single pass through the pools
+            for i in 0..total_pools as usize {
+                let entry = &mut *self.pool_directory.add(i);
+
+                if self.is_bit_set(i, true) {
+                    // Check if this is our pool
                     if self.compare_name(name, &entry.name) {
                         if let Some(pool) = &mut entry.pool {
-                            info!("Pool with name found: {}", core::str::from_utf8(name).unwrap());
-                            self.print_metadata_debug_info();
                             return Some(pool);
                         }
                     }
+                } else if first_free_slot.is_none() && !self.is_bit_set(i, false) {
+                    // Found first free slot
+                    first_free_slot = Some((i, entry));
                 }
             }
-        }
 
-        info!("no pool with name found, creating new pool");
+            // Create new pool if slot found
+            if let Some((index, entry)) = first_free_slot {
+                let pool_offset = self.get_pool_data_offset();
+                let pool_address = self.base_address + pool_offset + (index as u64 * FIXED_POOL_SIZE as u64);
 
-        // Create new pool if not found
-        for i in 0..total_pools {
-            unsafe {
-                if !self.is_bit_set(i as usize, true) {
-                    let entry = &mut *self.pool_directory.add(i as usize);
-                    info!("found empty slot in bitmap");
+                // Prepare new entry
+                let mut new_entry = PoolDirectoryEntry {
+                    name: [0; 64],
+                    pool: Some(Pool::new(pool_address, FIXED_POOL_SIZE)),
+                    _padding: [0; 8],
+                };
+                ptr::copy_nonoverlapping(name.as_ptr(), new_entry.name.as_mut_ptr(), name.len());
+                new_entry.name[name.len()] = 0;
 
-                    let pool_offset = self.get_pool_data_offset();
-                    let pool_address = self.base_address + pool_offset + (i as u64 * FIXED_POOL_SIZE as u64);
+                // Batch update metadata counters
+                let metadata = &*self.metadata;
+                metadata.used_pools.fetch_add(1, Ordering::Release);
+                metadata.initialized_pools.fetch_add(1, Ordering::Release);
+                metadata.total_allocations.fetch_add(1, Ordering::Release);
 
-                    // Create new pool
-                    let pool = Pool::new(pool_address, FIXED_POOL_SIZE);
+                // Set both bits in bitmap
+                let word_index = index / BITS_PER_WORD;
+                let bit_index = index % BITS_PER_WORD;
+                let mask = 1u64 << bit_index;
 
-                    // Update directory entry
-                    let mut new_entry = PoolDirectoryEntry {
-                        name: [0; 64],
-                        pool: Some(pool),
-                        _padding: [0; 8],
-                    };
-                    ptr::copy_nonoverlapping(name.as_ptr(), new_entry.name.as_mut_ptr(), name.len());
-                    new_entry.name[name.len()] = 0;
+                // Update bitmap words
+                let init_word = self.get_bitmap_word(false, word_index);
+                let used_word = self.get_bitmap_word(true, word_index);
 
-                    // Important: First persist the directory entry
-                    self.ensure_persistent_write(entry, new_entry);
+                init_word.fetch_or(mask, Ordering::SeqCst);
+                used_word.fetch_or(mask, Ordering::SeqCst);
 
-                    // Now set the bitmap bits - order matters!
-                    self.set_bit(i as usize, false, true); // Set initialized
-                    self.persist_bitmap_word(i as usize, false);
+                // Single fence before flushes
+                core::arch::x86_64::_mm_sfence();
 
-                    self.set_bit(i as usize, true, true); // Set used
-                    self.persist_bitmap_word(i as usize, true);
+                // Flush bitmap updates
+                core::arch::x86_64::_mm_clflush(init_word as *const AtomicU64 as *const u8);
+                core::arch::x86_64::_mm_clflush(used_word as *const AtomicU64 as *const u8);
 
-                    // Update and persist metadata counters
-                    (*self.metadata).used_pools.fetch_add(1, Ordering::Release);
-                    (*self.metadata).initialized_pools.fetch_add(1, Ordering::Release);
-                    (*self.metadata).total_allocations.fetch_add(1, Ordering::Release);
+                // Write and persist entry
+                ptr::write_volatile(entry, new_entry);
+                core::arch::x86_64::_mm_clflush(entry as *const PoolDirectoryEntry as *const u8);
 
-                    // Ensure metadata counters are persisted
-                    self.persist_metadata_counters();
+                // Final fence
+                core::arch::x86_64::_mm_sfence();
 
-                    return entry.pool.as_mut();
-                }
+                return entry.pool.as_mut();
             }
         }
         None

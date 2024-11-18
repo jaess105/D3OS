@@ -17,7 +17,6 @@ use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::alloc::Layout;
-use core::arch::x86_64::_rdtsc;
 use core::ffi::c_void;
 use core::hash::Hasher;
 use core::mem::size_of;
@@ -52,6 +51,7 @@ use crate::device::pit::Timer;
 use crate::device::ps2::Keyboard;
 use crate::device::qemu_cfg;
 use crate::device::serial::SerialPort;
+use crate::interrupt::interrupt_dispatcher::InterruptVector::Performance;
 use crate::memory::{MemorySpace, nvmem, PAGE_SIZE};
 use crate::memory::global_persistent_allocator::{GlobalPersistentAllocator, qemu_exit};
 use crate::memory::nvmem::Nfit;
@@ -692,25 +692,54 @@ fn run_all_tests(allocator: &mut GlobalPersistentAllocator) {
 
 // 1. Performance Measurement
 fn measure_performance_time(allocator: &mut GlobalPersistentAllocator) {
+    info!("=== Performance Tests ===");
 
-    let pool = allocator.get_or_create_pool(b"TIMING_MEASURE").unwrap();
+    // Get timer reference
+    let timer = crate::timer();
 
-    let start = unsafe { _rdtsc() };
+    // Measure pool creation
+    let start_ms = timer.systime_ms();
+    let pool = allocator.get_or_create_pool(b"PERF_TEST").unwrap();
+    let time_taken = timer.systime_ms() - start_ms;
+    info!("Pool creation: {} ms", time_taken);
 
+    // Measure single small allocation
+    let start_ms = timer.systime_ms();
     pool.transaction(|tx| {
-        for i in 0..1000 {
-            tx.allocate_with_id(&format!("perf{}", i), i as u64)?;
+        tx.allocate_with_id("single", 42u64)?;
+        Ok(())
+    }).expect("Single allocation failed");
+    let time_taken = timer.systime_ms() - start_ms;
+    info!("Single allocation: {} ms", time_taken);
+
+    // Measure bulk allocations
+    let start_ms = timer.systime_ms();
+    pool.transaction(|tx| {
+        for i in 0..100 {
+            tx.allocate_with_id(&format!("bulk{}", i), i as u64)?;
         }
         Ok(())
-    }).expect("Performance test failed");
+    }).expect("Bulk allocation failed");
+    let time_taken = timer.systime_ms() - start_ms;
+    info!("100 allocations: {} ms (avg: {} ms per allocation)",
+        time_taken,
+        time_taken as f64 / 100.0
+    );
 
-    let end  = unsafe { _rdtsc() };
-
-    info!("Performance Test: {} operations in {} ns", 1000, tsc_to_ns(end-start));
-
-    // Print detailed memory statistics
-    //pool.debug_print_object_table();
+    // Measure large allocation
+    let start_ms = timer.systime_ms();
+    pool.transaction(|tx| {
+        tx.allocate_with_id("large", LargeObject {
+            id: 1,
+            data: [0; 4096]
+        })?;
+        Ok(())
+    }).expect("Large allocation failed");
+    let time_taken = timer.systime_ms() - start_ms;
+    info!("4KB allocation: {} ms", time_taken);
 }
+
+
 
 // TODO: RECOVERY TEST
 // 2. Recovery Scenarios
