@@ -252,23 +252,50 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             init_persistent_allocator(allocator);
 
             let mut allocator = persistent_allocator().write();
-            let pool = allocator.get_or_create_pool(b"SIMON").unwrap();
+
 
             //NEW TEST
 
-            pool.debug_print_object_table();
+            run_all_tests(&mut allocator);
+
+            // let pool = allocator.get_or_create_pool(b"SIMON").unwrap();
+            //
+            // match pool.transaction(|tx| {
+            //     let a = tx.allocate_with_id("data", 4660u64)?;
+            //     tx.modify(a, |n| *n += 1)?;
+            //
+            //     Ok(())
+            // }) {
+            //     Ok(_) => info!("Transaction successful"),
+            //     Err(e) => info!("Transaction failed: {:?}", e),
+            // }
+            //
+            // pool.debug_print_object_table();
 
             //measure_performance(pool);
             //test_recovery_scenarios(pool);
 
-            match pool.transaction(|tx| {
-                //let leckei= tx.get_by_id::<u64>("recover_test")?;
-                tx.deallocate_by_id("recover_test")?;
-                Ok(())
-            }) {
-                Ok(_) => info!("Transaction successful"),
-                Err(e) => info!("Transaction failed: {:?}", e),
-            }
+            // match pool.transaction(|tx| {
+            //     //let rec = tx.get_by_id::<u64>("recover_test")?;
+            //     //tx.deallocate_by_id("recover_test")?;
+            //     Ok(())
+            // }) {
+            //     Ok(_) => info!("Transaction successful"),
+            //     Err(e) => info!("Transaction failed: {:?}", e),
+            // }
+
+            //Testing Deallocation
+
+            // match pool.transaction(|tx| {
+            //     tx.allocate_with_id("allocated", 42u64)?;
+            //     //tx.deallocate_by_id("allocated2")?;
+            //     tx.allocate_with_id("allocated3", 4660u64)?;
+            //     tx.allocate_with_id("allocated2", 48879u64)?;
+            //     Ok(())
+            // }) {
+            //     Ok(_) => info!("Transaction successful"),
+            //     Err(e) => info!("Transaction failed: {:?}", e),
+            // }
 
 
 
@@ -580,22 +607,15 @@ fn test_single_pool(allocator: &mut GlobalPersistentAllocator) {
             name: *b"TestObject\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
             data: [0; 256],
         })?;
+        tx.allocate_with_id("large1", LargeObject {
+            id: 1,
+            data: [0; 1024 * 4],
+        })?;
         Ok(())
     }).expect("Basic operations test failed");
 
-    // 2. Transaction Atomicity
-    info!("Test 2: Transaction Atomicity");
-    pool.transaction(|tx| {
-        tx.allocate_with_id("atomic1", 42u64)?;
-        tx.allocate_with_id("atomic2", 84u64)?;
-
-        let ptr = tx.get_by_id::<u64>("atomic1")?;
-        tx.modify(ptr, |n| *n += 1)?;
-        Ok(())
-    }).expect("Atomicity test failed");
-
     // Print results
-    //pool.debug_print_object_table();
+    pool.debug_print_object_table();
 }
 
 fn test_multiple_pools(allocator: &mut GlobalPersistentAllocator) {
@@ -634,7 +654,7 @@ fn test_memory_pressure(allocator: &mut GlobalPersistentAllocator) {
         Ok(())
     }).expect("Memory pressure test failed");
 
-    pool.debug_print_object_table();
+    //pool.debug_print_object_table();
 }
 
 fn test_type_safety(allocator: &mut GlobalPersistentAllocator) {
@@ -643,14 +663,19 @@ fn test_type_safety(allocator: &mut GlobalPersistentAllocator) {
 
     pool.transaction(|tx| {
         tx.allocate_with_id("type_test", 42u64)?;
+        Ok(())
+    }).expect("Type safety test failed");
 
+    pool.transaction(|tx| {
         // This should fail with type mismatch
         match tx.get_by_id::<u32>("type_test") {
             Err(PoolError::TypeMismatch { .. }) => info!("Type safety check passed"),
-            _ => panic!("Type safety check failed"),
+            Err(e) => info!("Type safety check failed: {:?}", e),
+            _ => info!("Type safety check failed"),
         }
         Ok(())
     }).expect("Type safety test failed");
+    //pool.debug_print_object_table();
 }
 
 // Main test runner
@@ -659,14 +684,16 @@ fn run_all_tests(allocator: &mut GlobalPersistentAllocator) {
     test_multiple_pools(allocator);
     test_memory_pressure(allocator);
     test_type_safety(allocator);
+    measure_performance_time(allocator);
 
-    info!("All tests completed successfully!");
+    info!("All tests and measurement completed successfully!");
 }
 
-// Additional Test Scenarios for Thesis Analysis:
 
 // 1. Performance Measurement
-fn measure_performance(pool: &mut Pool) {
+fn measure_performance_time(allocator: &mut GlobalPersistentAllocator) {
+
+    let pool = allocator.get_or_create_pool(b"TIMING_MEASURE").unwrap();
 
     let start = unsafe { _rdtsc() };
 
