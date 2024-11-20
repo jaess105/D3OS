@@ -421,18 +421,10 @@ impl GlobalPersistentAllocator {
     }
 
     fn get_pool_data_offset(&self) -> u64 {
-        info!("Calculating pool data offset:");
-        info!("  pool_directory_offset: 0x{:x}", unsafe {
-            (*self.metadata).pool_directory_offset
-        });
-        info!("  total_pools: {}", unsafe {
-            (*self.metadata).total_pools.load(Ordering::Relaxed)
-        });
-        info!(
-            "  sizeof PoolDirectoryEntry: {}",
-            mem::size_of::<PoolDirectoryEntry>()
-        );
-
+        //info!("Calculating pool data offset:");
+        //info!("  pool_directory_offset: 0x{:x}", unsafe { (*self.metadata).pool_directory_offset });
+        //info!("  total_pools: {}", unsafe { (*self.metadata).total_pools.load(Ordering::Relaxed)  });
+        //info!("  sizeof PoolDirectoryEntry: {}",mem::size_of::<PoolDirectoryEntry>());
         let offset = unsafe {
             // Remove self.base_address from here
             (*self.metadata).pool_directory_offset
@@ -440,7 +432,7 @@ impl GlobalPersistentAllocator {
                 * mem::size_of::<PoolDirectoryEntry>()) as u64
         };
 
-        info!("  Final offset: 0x{:x}", offset);
+        //info!("  Final offset: 0x{:x}", offset);
         offset
     }
 

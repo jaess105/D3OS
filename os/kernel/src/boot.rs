@@ -280,7 +280,8 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
 
             //NEW TEST
 
-            run_all_tests(&mut allocator);
+            //run_all_tests(&mut allocator);
+            test_full_usage_allocator(&mut allocator, 448);
 
             // let pool = allocator.get_or_create_pool(b"SIMON").unwrap();
             //
@@ -768,7 +769,7 @@ fn run_all_tests(allocator: &mut GlobalPersistentAllocator) {
 fn test_full_usage_allocator(allocator: &mut GlobalPersistentAllocator, total_pools: u64) {
     info!("=== Testing Full Usage of Allocator ===");
     for i in 0..total_pools {
-        let _ = allocator.get_or_create_pool(format!("POOL{i}").as_bytes()).unwrap();
+        allocator.get_or_create_pool(format!("POOL{i}").as_bytes()).unwrap();
     }
 }
 
