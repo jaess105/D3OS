@@ -11,7 +11,7 @@ use log::info;
 use crate::memory::global_persistent_allocator::qemu_exit;
 
 const POOL_MAGIC: u64 = 0x4433_4F53_504F4F4C; // "D3OS_POOL" in hex
-const MAX_OBJECT_ENTRIES: usize = 1024; //~88KB for table
+const MAX_OBJECT_ENTRIES: usize = 1024; //~88B*1024 for table
 
 // #[repr(u8)]
 // #[derive(Debug, Copy, Clone)]
@@ -40,7 +40,7 @@ pub struct ObjectTableEntry {
     valid: AtomicBool, // Data is valid (was written)
     active: AtomicBool, // Data is active (now usable) -> both has to be active
     operation_done: AtomicBool,
-    id: [u8; 55],
+    id: [u8; 32],
     id_len: u8,
     type_hash: u64,
     type_size: usize,
@@ -48,8 +48,8 @@ pub struct ObjectTableEntry {
 }
 
 #[repr(C)]
-pub struct PoolHeader {
-    magic: u64,
+pub(crate) struct PoolHeader {
+    pub(crate) magic: u64,
     size: usize,
     max_objects: usize,
     object_table_offset: u64,
@@ -76,10 +76,11 @@ pub enum PoolError {
 
 pub struct Pool {
     base_address: u64,
-    header: *mut PoolHeader,
+    pub(crate) header: *mut PoolHeader,
     object_table_offset: u64,
     heap: LockedHeap,
 }
+
 
 impl Pool {
     pub fn new(base: u64, size: usize) -> Self {
@@ -120,7 +121,7 @@ impl Pool {
             }
         }
 
-        pool.print_metadata_debug_info();
+        //pool.print_metadata_debug_info();
         pool
     }
 
@@ -176,6 +177,7 @@ impl Pool {
                     }
                     else {
                         //wert deaktivieren... kann nur neu gemacht werden über allocate!
+                        Self::deallocate(self, entry.data.unwrap(), Layout::from_size_align(entry.type_size, 64).unwrap());
                         entry.active.store(false, Ordering::Release);//TODO: Absprechen
                     }
 
@@ -202,6 +204,10 @@ impl Pool {
             core::arch::x86_64::_mm_clflush(ptr);
             core::arch::x86_64::_mm_sfence();
         }
+    }
+
+    unsafe fn deallocate(&mut self, ptr: NonNull<u8>, layout: Layout) {
+        self.heap.lock().deallocate(ptr, layout);
     }
 
     fn print_metadata_debug_info(&self) {
@@ -265,7 +271,7 @@ impl<'a> TransactionContext<'a> {
 
     pub fn allocate_with_id<T: Copy + 'static>(&mut self, id: &str, data: T) -> Result<NonNull<T>, PoolError> {
 
-        if id.len() > 55 {
+        if id.len() >32 {
             return Err(PoolError::InvalidId);
         }
 
@@ -311,6 +317,7 @@ impl<'a> TransactionContext<'a> {
             // Single flush for metadata
             Pool::flush_cache_line(entry as *const _ as *const u8);
 
+            //  TODO: Layout anpassen!
             // Allocate and write data
             let ptr = self.pool.heap.lock()
                 .allocate_first_fit(Layout::new::<T>())

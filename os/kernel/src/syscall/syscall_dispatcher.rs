@@ -100,8 +100,8 @@ impl SyscallTable {
                 sys_get_date as *const _,
                 sys_set_date as *const _,
                 sys_mkdir as *const _,
-                sys_create_persistent_pool as *const _,
-                sys_release_persistent_pool as *const _,
+                //sys_create_persistent_pool as *const _,
+                //sys_release_persistent_pool as *const _,
                 //sys_perform_transaction as *const _,
             ],
         }

@@ -3,11 +3,12 @@
 extern crate alloc;
 
 use alloc::string::String;
-use persistent::{create_persistent_pool};
+//use persistent::{create_persistent_pool};
 use terminal::read::read;
 use terminal::{print, println};
 #[allow(unused_imports)]
 use runtime::*;
+use terminal::write::print;
 
 #[unsafe(no_mangle)]
 pub fn main() {
@@ -33,24 +34,24 @@ pub fn main() {
     //     }
     // };
 
-    let mut input = String::new();
-    print!("Enter pool name: ");
-
-    loop {
-        match read() {
-            Some(ch) => {
-                match ch {
-                    '\n' => break,
-                    _ => {
-                        input.push(ch);
-                        //print!("{}", ch); // Echo character
-                    }
-                }
-            }
-            None => (),
-        }
-    }
-    print!("\n");
+    // let mut input = String::new();
+    // print!("Enter pool name: ");
+    //
+    // loop {
+    //     match read() {
+    //         Some(ch) => {
+    //             match ch {
+    //                 '\n' => break,
+    //                 _ => {
+    //                     input.push(ch);
+    //                     //print!("{}", ch); // Echo character
+    //                 }
+    //             }
+    //         }
+    //         None => (),
+    //     }
+    // }
+    // print!("\n");
 
     // if operation {
     //     match create_persistent_pool(&input) {
@@ -65,33 +66,33 @@ pub fn main() {
     // }
 
     // Create/access pool
-    match create_persistent_pool(&input) {
-        Ok(_) => {
-            // Get data to store
-            let mut data = String::new();
-            print!("Enter data to store: ");
-
-            loop {
-                match read() {
-                    Some(ch) => {
-                        match ch {
-                            '\n' => break,
-                            _ => {
-                                data.push(ch);
-                            },
-                        }
-                    },
-                    None => (),
-                }
-            }
-            print!("\n");
-            print!("Storing data in pool as : '{:#?}'\n", data.as_bytes());
-            // match perform_transaction(&input, data.as_bytes()) {
-            //     Ok(_) => println!("Successfully stored data in pool"),
-            //     Err(e) => println!("Transaction failed: {}", e),
-            // }
-        },
-        Err(e) => println!("Failed to create/access pool: {}", e),
-    }
-
+    // match create_persistent_pool(&input) {
+    //     Ok(_) => {
+    //         // Get data to store
+    //         let mut data = String::new();
+    //         print!("Enter data to store: ");
+    //
+    //         loop {
+    //             match read() {
+    //                 Some(ch) => {
+    //                     match ch {
+    //                         '\n' => break,
+    //                         _ => {
+    //                             data.push(ch);
+    //                         },
+    //                     }
+    //                 },
+    //                 None => (),
+    //             }
+    //         }
+    //         print!("\n");
+    //         print!("Storing data in pool as : '{:#?}'\n", data.as_bytes());
+    //         // match perform_transaction(&input, data.as_bytes()) {
+    //         //     Ok(_) => println!("Successfully stored data in pool"),
+    //         //     Err(e) => println!("Transaction failed: {}", e),
+    //         // }
+    //     },
+    //     Err(e) => println!("Failed to create/access pool: {}", e),
+    // }
+    print!("Hello from nv!\n");
 }

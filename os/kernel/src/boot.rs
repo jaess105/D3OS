@@ -17,6 +17,7 @@ use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::alloc::Layout;
+use core::arch::x86_64::_rdtsc;
 use core::ffi::c_void;
 use core::hash::Hasher;
 use core::mem::size_of;
@@ -246,12 +247,35 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             let nvram_base = range.as_phys_frame_range().start.start_address().as_u64();
             let nvram_size = (range.as_phys_frame_range().end - range.as_phys_frame_range().start)
                 as usize * PAGE_SIZE;
-
+            let timer_start = timer.systime_ms();
+            let start = unsafe { _rdtsc()};
             let allocator = GlobalPersistentAllocator::new(nvram_base, nvram_size);
+            let end = unsafe { _rdtsc()};
+            let timer_end = timer.systime_ms();
+            info!("Time taken to create allocator: {} tsc", end - start);
+            info!("Time taken to create allocator: {} ms", timer_end - timer_start);
             info!("About to store allocator in global storage");
             init_persistent_allocator(allocator);
 
             let mut allocator = persistent_allocator().write();
+            //allocator.print_bitmap();
+            //allocator.release_pool(b"SIMON");
+            // allocator.release_pool(b"SIMON");
+            // allocator.release_pool(b"POOL1");
+            //
+            // match allocator.get_or_create_pool(b"SIMON") {
+            //
+            //     Ok(pool) => {
+            //         info!("Pool created/found successfully");
+            //         pool.debug_print_object_table();
+            //         pool.transaction(|tx| {
+            //             tx.allocate_with_id("test", 42u64)?;
+            //             Ok(())
+            //         }).expect("Failed");
+            //     }
+            //
+            //     Err(e) => info!("Error: {:?}", e),
+            // }
 
 
             //NEW TEST
@@ -678,19 +702,6 @@ fn test_type_safety(allocator: &mut GlobalPersistentAllocator) {
     //pool.debug_print_object_table();
 }
 
-// Main test runner
-fn run_all_tests(allocator: &mut GlobalPersistentAllocator) {
-    test_single_pool(allocator);
-    test_multiple_pools(allocator);
-    test_memory_pressure(allocator);
-    test_type_safety(allocator);
-    measure_performance_time(allocator);
-
-    info!("All tests and measurement completed successfully!");
-}
-
-
-// 1. Performance Measurement
 fn measure_performance_time(allocator: &mut GlobalPersistentAllocator) {
     info!("=== Performance Tests ===");
 
@@ -737,6 +748,28 @@ fn measure_performance_time(allocator: &mut GlobalPersistentAllocator) {
     }).expect("Large allocation failed");
     let time_taken = timer.systime_ms() - start_ms;
     info!("4KB allocation: {} ms", time_taken);
+}
+
+
+// Main test runner
+fn run_all_tests(allocator: &mut GlobalPersistentAllocator) {
+    test_single_pool(allocator);
+    test_multiple_pools(allocator);
+    test_memory_pressure(allocator);
+    test_type_safety(allocator);
+    measure_performance_time(allocator);
+
+    info!("All tests and measurement completed successfully!");
+}
+
+
+//FOR ME ONLY
+
+fn test_full_usage_allocator(allocator: &mut GlobalPersistentAllocator, total_pools: u64) {
+    info!("=== Testing Full Usage of Allocator ===");
+    for i in 0..total_pools {
+        let _ = allocator.get_or_create_pool(format!("POOL{i}").as_bytes()).unwrap();
+    }
 }
 
 

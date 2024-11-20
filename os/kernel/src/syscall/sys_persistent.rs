@@ -5,32 +5,32 @@ use crate::memory::pool::Pool;
 use crate::persistent_allocator;
 
 // This just creates/finds the pool and returns success
-pub fn sys_create_persistent_pool(name_ptr: *const u8, name_len: usize) -> isize {
-    if name_ptr.is_null() || name_len < 1 {
-        return -1;
-    }
-
-    info!("Creating persistent pool, ptr: {:?}, len: {}", name_ptr, name_len);
-    let name = unsafe { slice_from_raw_parts(name_ptr, name_len).as_ref().unwrap() };
-    info!("Pool name: {:?}", core::str::from_utf8(name));
-
-    let mut allocator = persistent_allocator().write();
-    match allocator.get_or_create_pool(name) {
-        Some(_) => 0,  // Just verify pool exists/created
-        None => -1,
-    }
-}
-
-pub fn sys_release_persistent_pool(name_ptr: *const u8, name_len: usize) -> isize {
-    let name = unsafe { slice_from_raw_parts(name_ptr, name_len).as_ref().unwrap() };
-
-    let mut allocator = persistent_allocator().write();
-    if allocator.release_pool(name) {
-        0
-    } else {
-        -1
-    }
-}
+// pub fn sys_create_persistent_pool(name_ptr: *const u8, name_len: usize) -> isize {
+//     if name_ptr.is_null() || name_len < 1 {
+//         return -1;
+//     }
+//
+//     info!("Creating persistent pool, ptr: {:?}, len: {}", name_ptr, name_len);
+//     let name = unsafe { slice_from_raw_parts(name_ptr, name_len).as_ref().unwrap() };
+//     info!("Pool name: {:?}", core::str::from_utf8(name));
+//
+//     let mut allocator = persistent_allocator().write();
+//     match allocator.get_or_create_pool(name) {
+//         Some(_) => 0,  // Just verify pool exists/created
+//         None => -1,
+//     }
+// }
+//
+// pub fn sys_release_persistent_pool(name_ptr: *const u8, name_len: usize) -> isize {
+//     let name = unsafe { slice_from_raw_parts(name_ptr, name_len).as_ref().unwrap() };
+//
+//     let mut allocator = persistent_allocator().write();
+//     if allocator.release_pool(name) {
+//         0
+//     } else {
+//         -1
+//     }
+// }
 
 // pub fn sys_perform_transaction(
 //     pool_name_ptr: *const u8,
