@@ -9,17 +9,15 @@
 */
 
 use crate::interrupt::interrupt_dispatcher;
-use crate::{naming, efi_services_available, init_persistent_allocator, persistent_allocator};
+use crate::{naming, init_persistent_allocator, persistent_allocator};
 use crate::syscall::syscall_dispatcher;
 use crate::process::thread::Thread;
 use alloc::format;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::alloc::Layout;
 use core::arch::x86_64::_rdtsc;
 use core::ffi::c_void;
-use core::hash::Hasher;
 use core::mem::size_of;
 use core::ops::Deref;
 use core::ptr;
@@ -52,9 +50,8 @@ use crate::device::pit::Timer;
 use crate::device::ps2::Keyboard;
 use crate::device::qemu_cfg;
 use crate::device::serial::SerialPort;
-use crate::interrupt::interrupt_dispatcher::InterruptVector::Performance;
 use crate::memory::{MemorySpace, nvmem, PAGE_SIZE};
-use crate::memory::global_persistent_allocator::{GlobalPersistentAllocator, qemu_exit};
+use crate::memory::global_persistent_allocator::{AllocError, GlobalPersistentAllocator, qemu_exit};
 use crate::memory::nvmem::Nfit;
 use crate::memory::pool::{Pool, PoolError};
 use crate::memory::r#virtual::page_table_index;
@@ -258,6 +255,8 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             init_persistent_allocator(allocator);
 
             let mut allocator = persistent_allocator().write();
+
+
             //allocator.print_bitmap();
             //allocator.release_pool(b"SIMON");
             // allocator.release_pool(b"SIMON");
@@ -270,18 +269,31 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             //         pool.debug_print_object_table();
             //         pool.transaction(|tx| {
             //             tx.allocate_with_id("test", 42u64)?;
+            //             qemu_exit(123);
             //             Ok(())
             //         }).expect("Failed");
-            //     }
             //
+            //
+            //     }
             //     Err(e) => info!("Error: {:?}", e),
             // }
+
+            // let pool = allocator.get_or_create_pool(b"SIMON").unwrap();
+            // pool.transaction(|tx| {
+            //     match tx.get_by_id::<u64>("test") {
+            //         Err(PoolError::InvalidId) => info!("Worked"),
+            //         _ => info!("Failed")
+            //     }
+            //     Ok(())
+            // }).expect("Failed");
 
 
             //NEW TEST
 
             //run_all_tests(&mut allocator);
-            test_full_usage_allocator(&mut allocator, 448);
+            //test_full_usage_allocator(&mut allocator);
+            test_crash_recovery(&mut allocator);
+
 
             // let pool = allocator.get_or_create_pool(b"SIMON").unwrap();
             //
@@ -627,6 +639,7 @@ fn test_single_pool(allocator: &mut GlobalPersistentAllocator) {
     info!("Test 1: Basic Operations");
     pool.transaction(|tx| {
         tx.allocate_with_id("small1", SmallObject { id: 1, active: true })?;
+        info!("Small object allocated");
         tx.allocate_with_id("medium1", MediumObject {
             id: 1,
             name: *b"TestObject\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
@@ -636,11 +649,19 @@ fn test_single_pool(allocator: &mut GlobalPersistentAllocator) {
             id: 1,
             data: [0; 1024 * 4],
         })?;
+        info!("Large object allocated");
+
+        tx.deallocate_by_id("small1")?;
+
+
+
+        tx.allocate_with_id("small2", SmallObject { id: 2, active: false })?;
+        tx.allocate_with_id("small1", SmallObject { id: 123, active: true })?;
         Ok(())
     }).expect("Basic operations test failed");
 
     // Print results
-    pool.debug_print_object_table();
+    //pool.debug_print_object_table();
 }
 
 fn test_multiple_pools(allocator: &mut GlobalPersistentAllocator) {
@@ -663,6 +684,16 @@ fn test_multiple_pools(allocator: &mut GlobalPersistentAllocator) {
             Ok(())
         }).expect("Pool 2 test failed");
     }
+
+    // Test Pool 3
+    //DOC: wiederverwendbar
+    {
+        allocator.release_pool(b"POOL1");
+        let pool3 = allocator.get_or_create_pool(b"POOL3").unwrap();
+        pool3.debug_print_object_table();
+    }
+
+
 }
 
 fn test_memory_pressure(allocator: &mut GlobalPersistentAllocator) {
@@ -763,17 +794,187 @@ fn run_all_tests(allocator: &mut GlobalPersistentAllocator) {
     info!("All tests and measurement completed successfully!");
 }
 
-
 //FOR ME ONLY
 
-fn test_full_usage_allocator(allocator: &mut GlobalPersistentAllocator, total_pools: u64) {
+fn test_full_usage_allocator(allocator: &mut GlobalPersistentAllocator) {
     info!("=== Testing Full Usage of Allocator ===");
-    for i in 0..total_pools {
-        allocator.get_or_create_pool(format!("POOL{i}").as_bytes()).unwrap();
+    let mut i = 1;
+    loop {
+        match allocator.get_or_create_pool(format!("POOL{i}").as_bytes()) {
+            Ok(_) => i+=1,
+            Err(e) => {
+                match e {
+                    AllocError::NoPoolsAvailable => {
+                        info!("No more pools available");
+                        break;
+                    },
+                    _ => {
+                        panic!("Error: {:?}", e);
+                    }
+                }
+            }
+        }
     }
 }
 
+fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
+    info!("=== Testing Crash Recovery ===");
+    let pool = allocator.get_or_create_pool(b"RECOVERY_TEST").unwrap();
 
+    // 1. Test recovery after allocation crash
+    info!("Test 1: Recovery after allocation crash");
+    pool.transaction(|tx| {
+        tx.allocate_with_id("recover1", SmallObject { id: 1, active: true })?;
+        // Simulate crash by returning error
+        Err::<(), PoolError>(PoolError::TransactionFailed)
+    }).expect_err("Transaction should fail");
+
+    // Verify recovery
+    pool.transaction(|tx| {
+        match tx.get_by_id::<SmallObject>("recover1") {
+            Err(PoolError::InvalidId) => info!("Recovery successful - object properly rolled back"),
+            Ok(_) => panic!("Recovery failed - object still exists after rollback"),
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        }
+        Ok(())
+    }).expect("Recovery verification failed");
+
+
+    // 2. Test recovery after modification crash
+    info!("Test 2: Recovery after modification crash");
+    pool.transaction(|tx| {
+        tx.allocate_with_id("recover2", SmallObject { id: 2, active: false })?;
+        Ok(())
+    }).expect("Initial allocation failed");
+
+    pool.transaction(|tx| {
+        let ptr = tx.get_by_id::<SmallObject>("recover2")?;
+        tx.modify(ptr, |obj| obj.active = true)?;
+        // Simulate crash during modification
+        Err::<(), PoolError>(PoolError::TransactionFailed)
+    }).expect_err("Transaction should fail");
+
+    //Verify recovery
+    pool.transaction(|tx| {
+        let obj = tx.read_by_id::<SmallObject>("recover2")?;
+        assert!(!obj.active, "Recovery failed - modification persisted after rollback");
+        info!("Recovery successful - modification properly rolled back");
+        Ok(())
+    }).expect("Recovery verification failed");
+
+    // 3. Test recovery after deallocation crash
+    info!("Test 3: Recovery after deallocation crash");
+    pool.transaction(|tx| {
+        tx.allocate_with_id("recover3", MediumObject {
+            id: 3,
+            name: *b"TestObject\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+            data: [0; 256],
+        })?;
+        Ok(())
+    }).expect("Initial allocation failed");
+
+    pool.transaction(|tx| {
+        tx.deallocate_by_id("recover3")?;
+        // Simulate crash during deallocation
+        Err::<(), PoolError>(PoolError::TransactionFailed)
+    }).expect_err("Transaction should fail");
+
+    // Verify recovery
+    pool.transaction(|tx| {
+        match tx.get_by_id::<MediumObject>("recover3") {
+            Ok(_) => info!("Recovery successful - deallocation properly rolled back"),
+            Err(e) => info!("Recovery failed - object not found after rollback: {:?}", e),
+        }
+        Ok(())
+    }).expect("Recovery verification failed");
+
+    // 4. Test recovery of multiple operations
+    info!("Test 4: Recovery of multiple operations");
+    pool.transaction(|tx| {
+        // Multiple operations in one transaction
+        tx.allocate_with_id("multi1", SmallObject { id: 4, active: true })?;
+        tx.allocate_with_id("multi2", SmallObject { id: 5, active: false })?;
+        let ptr = tx.get_by_id::<SmallObject>("multi2")?;
+        tx.modify(ptr, |obj| obj.active = true)?;
+        tx.deallocate_by_id("multi1")?;
+        // Simulate crash
+        Err::<(), PoolError>(PoolError::TransactionFailed)
+    }).expect_err("Transaction should fail");
+
+    // Verify complete rollback
+    pool.transaction(|tx| {
+        assert!(tx.get_by_id::<SmallObject>("multi1").is_err(),
+                "Recovery failed - multi1 exists");
+        assert!(tx.get_by_id::<SmallObject>("multi2").is_err(),
+                "Recovery failed - multi2 exists");
+        info!("Recovery successful - all operations properly rolled back");
+        Ok(())
+    }).expect("Recovery verification failed");
+
+    // // 5. Test system crash recovery (simulate power loss)
+    // info!("Test 5: System crash recovery");
+    // pool.transaction(|tx| {
+    //     tx.allocate_with_id("crash", LargeObject {
+    //         id: 6,
+    //         data: [42; 1024 * 4],
+    //     })?;
+    //     unsafe { qemu_exit(1); } // Simulate sudden power loss
+    //     Ok(())
+    // }).ok(); // We don't expect this to complete
+    //
+    // // In real system, this would be after restart
+    // // Here we just create a new pool instance
+    // let pool = allocator.get_or_create_pool(b"RECOVERY_TEST").unwrap();
+    // pool.transaction(|tx| {
+    //     match tx.get_by_id::<LargeObject>("crash") {
+    //         Err(PoolError::InvalidId) => info!("Crash recovery successful - incomplete transaction rolled back"),
+    //         Ok(_) => panic!("Crash recovery failed - incomplete transaction persisted"),
+    //         Err(e) => panic!("Unexpected error during crash recovery: {:?}", e),
+    //     }
+    //     Ok(())
+    // }).expect("Crash recovery verification failed");
+}
+
+// fn test_concurrent_recovery(allocator: &mut GlobalPersistentAllocator) {
+//     info!("=== Testing Recovery with Multiple Pools ===");
+//
+//     // Setup pools
+//     let pool1 = allocator.get_or_create_pool(b"RECOVERY_POOL1").unwrap();
+//     let pool2 = allocator.get_or_create_pool(b"RECOVERY_POOL2").unwrap();
+//
+//     // Create initial data
+//     pool1.transaction(|tx| {
+//         tx.allocate_with_id("p1_data", 42u64)?;
+//         Ok(())
+//     }).expect("Initial setup failed");
+//
+//     pool2.transaction(|tx| {
+//         tx.allocate_with_id("p2_data", 84u64)?;
+//         Ok(())
+//     }).expect("Initial setup failed");
+//
+//     // Simulate crash in pool1
+//     pool1.transaction(|tx| {
+//         tx.modify(tx.get_by_id::<u64>("p1_data")?, |v| *v = 100)?;
+//         Err::<(), PoolError>(PoolError::TransactionFailed)
+//     }).expect_err("Transaction should fail");
+//
+//     // Verify pool2 is unaffected
+//     pool2.transaction(|tx| {
+//         let value = tx.read_by_id::<u64>("p2_data")?;
+//         assert_eq!(value, 84, "Pool2 was affected by Pool1's crash");
+//         info!("Pool isolation during recovery verified");
+//         Ok(())
+//     }).expect("Pool2 verification failed");
+//
+//     // Verify pool1 recovered correctly
+//     pool1.transaction(|tx| {
+//         let value = tx.read_by_id::<u64>("p1_data")?;
+//         assert_eq!(value, 42, "Pool1 recovery failed");
+//         info!("Pool1 recovered successfully");
+//         Ok(())
+//     }).expect("Pool1 recovery verification failed");
+// }
 
 // TODO: RECOVERY TEST
 // 2. Recovery Scenarios

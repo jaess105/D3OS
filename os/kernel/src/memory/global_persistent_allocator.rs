@@ -1,21 +1,22 @@
-use crate::memory::pool::Pool;
-use bitflags::bitflags;
+use crate::memory::pool::{Pool,};
 use core::mem;
 use core::mem::size_of;
 use core::ptr;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use log::{info, Metadata};
+use log::{info,};
 use x86_64::instructions::port::Port;
 
 const ALLOCATOR_MAGIC: u64 = 0x4433_4F53_4E56_4D4D; // "D3OS_NVMM"
 
 // Fixed pool size for each pool
 // DO NOT SET THIS SMALLER THAN 8Kb ! Space for metadata needed
-const FIXED_POOL_SIZE: usize = 1024*1024;// 1MB
+pub const FIXED_POOL_SIZE: usize = 1024*1024;// 1MB
 
 const BITS_PER_WORD: usize = 64;
 const METADATA_SIZE: usize = core::mem::size_of::<GlobalMetadata>();
 const DIRECTORY_ALIGNMENT: usize = 8;
+
+pub const LOG_POOL_NAME: &'static [u8] = b"__LOG__"; // Reserved name for log pool
 
 #[repr(C)]
 pub(crate) struct GlobalMetadata {
@@ -28,6 +29,7 @@ pub(crate) struct GlobalMetadata {
     bitmap_offset: u64, // Offset to bitmap array
     pool_directory_offset: u64,
     bitmap_words: usize,
+    log_pool_offset: u64,
     // Statistics
     initialization_failures: AtomicU32,
     total_allocations: AtomicUsize,
@@ -53,6 +55,7 @@ pub(crate) struct GlobalPersistentAllocator {
     metadata: *mut GlobalMetadata,
     bitmap: *mut PoolBitmap,
     pool_directory: *mut PoolDirectoryEntry,
+    log_pool_address: Option<u64>, // Direct pointer to the log pool instead of searching always
 }
 
 #[derive(Debug)]
@@ -65,10 +68,11 @@ pub struct RecoveryStatus {
 }
 
 #[derive(Debug)]
-pub enum PoolError {
-    NameTooLong,
+pub enum AllocError {
+    NameTooLongOrShort,
     NoPoolsAvailable,
     InconsistentState,
+    NameNotAllowed,
 }
 
 unsafe impl Send for GlobalPersistentAllocator {}
@@ -174,18 +178,25 @@ impl GlobalPersistentAllocator {
         let directory_offset = bitmap_offset + (bitmap_words * 2 * size_of::<AtomicU64>());
         let directory_offset = (directory_offset + DIRECTORY_ALIGNMENT - 1) & !(DIRECTORY_ALIGNMENT - 1);
 
-        let allocator = Self {
+        let mut allocator = Self {
             base_address,
             metadata,
             bitmap: (base_address + bitmap_offset as u64) as *mut PoolBitmap,
             pool_directory: (base_address + directory_offset as u64) as *mut PoolDirectoryEntry,
+            log_pool_address: None
         };
 
         unsafe {
             if (*metadata).magic_number != ALLOCATOR_MAGIC {
                 info!("Initializing new NVDIMM metadata");
                 allocator.initialize(nvdimm_size, max_pools, bitmap_offset, directory_offset, bitmap_words);
-
+                // match allocator.create_log_pool() {
+                //     Ok(_) => info!("LOG pool initialized"),
+                //     Err(e) => panic!("Failed to create LOG pool: {:?}", e),
+                // }
+                if let Err(e) = allocator.create_log_pool() {
+                    panic!("Failed to create LOG pool: {:?}", e);
+                }
             } else {
                 info!("Found existing NVDIMM metadata, checking status");
                 let status = allocator.check_recovery_status();
@@ -194,8 +205,26 @@ impl GlobalPersistentAllocator {
                     info!("Recovery check failed: {:?}, reinitializing", status);
                     //Offsets might be wrong, so we need to reinitialize because its to risky to use
                     allocator.initialize(nvdimm_size, max_pools, bitmap_offset, directory_offset, bitmap_words);
-
+                    match allocator.create_log_pool() {
+                        Ok(_) => info!("LOG pool initialized"),
+                        Err(e) => panic!("Failed to create LOG pool: {:?}", e),
+                    }
                 } else {
+                    // if (*metadata).log_pool_offset != 0 {
+                    //     // Restore log pool pointer from metadata
+                    //     //TODO: FALLS JETZT ALLOC NICHT MEHR GEHT ? EGAL
+                    //    allocator.log_pool_address = Some(base_address + (*metadata).log_pool_offset);
+                    //
+                    // } else {
+                    //     panic!("Invalid metadata: log pool offset is 0");
+                    // }
+                    if (*metadata).log_pool_offset != 0 {
+                        // Restore static log pool
+                        Pool::init_log_pool(base_address + (*metadata).log_pool_offset);
+                    } else {
+                        panic!("Invalid metadata: log pool offset is 0");
+                    }
+
                     info!("Recovery check successful: {:?}", status);
                     // Verify configuration
                     assert_eq!((*metadata).nvdimm_size, nvdimm_size, "NVDIMM size mismatch");
@@ -204,7 +233,7 @@ impl GlobalPersistentAllocator {
 
             }
         }
-        //allocator.print_metadata_debug_info();
+        allocator.print_metadata_debug_info();
         allocator
     }
 
@@ -221,6 +250,7 @@ impl GlobalPersistentAllocator {
                 bitmap_offset: bitmap_offset as u64,
                 pool_directory_offset: directory_offset as u64,
                 bitmap_words,
+                log_pool_offset: 0,
                 initialization_failures: AtomicU32::new(0),
                 total_allocations: AtomicUsize::new(0),
                 total_deallocations: AtomicUsize::new(0),
@@ -281,9 +311,13 @@ impl GlobalPersistentAllocator {
     }
 
     /// Creates a new pool or recovers an existing one
-    pub fn get_or_create_pool(&mut self, name: &[u8]) -> Result<&mut Pool, PoolError> {
-        if name.len() >= 64 {
-            return Err(PoolError::NameTooLong);
+    pub fn get_or_create_pool(&mut self, name: &[u8]) -> Result<&mut Pool, AllocError> {
+        if name.len() >= 64 || name.len() <= 0 {
+            return Err(AllocError::NameTooLongOrShort);
+        }
+
+        if name == LOG_POOL_NAME {
+            return Err(AllocError::NameNotAllowed);
         }
 
         unsafe {
@@ -311,14 +345,14 @@ impl GlobalPersistentAllocator {
             //Could be that the bitmap insnt full but no more store!
             if used_pools >= total_pools {
                 info!("Cannot create new pool: all {} pools are in use", total_pools);
-                return Err(PoolError::NoPoolsAvailable);
+                return Err(AllocError::NoPoolsAvailable);
             }
 
             if first_free_slot.is_none() {
                 info!("Inconsistency detected: used_pools reported {} free slots but none found",
                   total_pools - used_pools);
                 (*self.metadata).initialization_failures.fetch_add(1, Ordering::Release);
-                return Err(PoolError::InconsistentState);
+                return Err(AllocError::InconsistentState);
             }
 
             // Create new pool in free slot...
@@ -332,11 +366,13 @@ impl GlobalPersistentAllocator {
             // Prepare new entry
             let mut new_entry = PoolDirectoryEntry {
                 name: [0; 64],
-                pool: Some(Pool::new(pool_address, FIXED_POOL_SIZE)),
+                //pool: Some(Pool::new(pool_address, FIXED_POOL_SIZE, self.log_pool_address)),
+                pool: Some(Pool::new(pool_address, FIXED_POOL_SIZE)),//test
                 _padding: [0; 8],
             };
             ptr::copy_nonoverlapping(name.as_ptr(), new_entry.name.as_mut_ptr(), name.len());
             new_entry.name[name.len()] = 0;
+            info!("Created new Pool wiht logpool: {:?}", self.log_pool_address);
 
             // Batch update metadata counters
             let metadata = &*self.metadata;
@@ -370,12 +406,135 @@ impl GlobalPersistentAllocator {
             // Final fence
             core::arch::x86_64::_mm_sfence();
 
-            entry.pool.as_mut().ok_or(PoolError::InconsistentState)
+
+
+            entry.pool.as_mut().ok_or(AllocError::InconsistentState)
 
         }
     }
 
+    fn create_log_pool(&mut self) -> Result<(), AllocError> {
+        unsafe {
+            info!("Creating log pool");
+            let total_pools = (*self.metadata).total_pools.load(Ordering::Acquire);
+
+            for i in 0..total_pools as usize {
+                let entry = &mut *self.pool_directory.add(i);
+
+                if !self.is_bit_set(i, true) && !self.is_bit_set(i, false) {
+                    let pool_offset = self.get_pool_data_offset();
+                    let pool_address = self.base_address + pool_offset +
+                        (i as u64 * FIXED_POOL_SIZE as u64);
+
+                    info!("Creating log pool at address: 0x{:x}", pool_address);
+
+                    // Initialize the static log pool first
+                    Pool::init_log_pool(pool_address);
+
+                    // Create directory entry
+                    let mut new_entry = PoolDirectoryEntry {
+                        name: [0; 64],
+                        pool: None,
+                        _padding: [0; 8],
+                    };
+
+                    ptr::copy_nonoverlapping(
+                        LOG_POOL_NAME.as_ptr(),
+                        new_entry.name.as_mut_ptr(),
+                        LOG_POOL_NAME.len()
+                    );
+
+                    // Update bitmap and entry
+                    self.set_bit(i, true, true);
+                    self.set_bit(i, false, true);
+
+                    ptr::write_volatile(entry, new_entry);
+                    core::arch::x86_64::_mm_sfence();
+                    core::arch::x86_64::_mm_clflush(entry as *const PoolDirectoryEntry as *const u8);
+                    core::arch::x86_64::_mm_sfence();
+
+                    // Update metadata
+                    (*self.metadata).log_pool_offset = pool_address - self.base_address;
+                    (*self.metadata).used_pools.fetch_add(1, Ordering::Release);
+                    (*self.metadata).initialized_pools.fetch_add(1, Ordering::Release);
+
+                    return Ok(());
+                }
+            }
+            Err(AllocError::NoPoolsAvailable)
+        }
+        // unsafe {
+        //     info!("Creating log pool");
+        //     let total_pools = (*self.metadata).total_pools.load(Ordering::Acquire);
+        //
+        //     // Find first free slot
+        //     for i in 0..total_pools as usize {
+        //         let entry = &mut *self.pool_directory.add(i);
+        //
+        //         if !self.is_bit_set(i, true) && !self.is_bit_set(i, false) {
+        //             // Calculate pool address
+        //             let pool_offset = self.get_pool_data_offset();
+        //             let pool_address = self.base_address + pool_offset +
+        //                 (i as u64 * FIXED_POOL_SIZE as u64);
+        //
+        //             info!("Creating log pool at address: 0x{:x}", pool_address);
+        //
+        //             // Create directory entry
+        //             let mut new_entry = PoolDirectoryEntry {
+        //                 name: [0; 64],
+        //                 pool: Some(Pool::new(pool_address, FIXED_POOL_SIZE, None)), // Log pool doesn't need its own log pool
+        //                 _padding: [0; 8],
+        //             };
+        //
+        //             // Copy name
+        //             ptr::copy_nonoverlapping(
+        //                 LOG_POOL_NAME.as_ptr(),
+        //                 new_entry.name.as_mut_ptr(),
+        //                 LOG_POOL_NAME.len()
+        //             );
+        //
+        //             // Set bitmap bits
+        //             self.set_bit(i, true, true);
+        //             self.set_bit(i, false, true);
+        //
+        //             // Write and persist entry
+        //             ptr::write_volatile(entry, new_entry);
+        //             core::arch::x86_64::_mm_sfence();
+        //             core::arch::x86_64::_mm_clflush(entry as *const PoolDirectoryEntry as *const u8);
+        //             core::arch::x86_64::_mm_sfence();
+        //
+        //             // Store log pool address
+        //             self.log_pool_address = Some(pool_address);
+        //
+        //             // Update metadata with log pool location
+        //             (*self.metadata).log_pool_offset = pool_address - self.base_address;
+        //
+        //             // Update metadata counters
+        //             (*self.metadata).used_pools.fetch_add(1, Ordering::Release);
+        //             (*self.metadata).initialized_pools.fetch_add(1, Ordering::Release);
+        //
+        //             // Ensure metadata is persisted
+        //             core::arch::x86_64::_mm_sfence();
+        //             core::arch::x86_64::_mm_clflush(self.metadata as *const u8);
+        //             core::arch::x86_64::_mm_sfence();
+        //
+        //             return Ok(());
+        //         }
+        //     }
+        //     Err(AllocError::NoPoolsAvailable)
+        // }
+    }
+
+
     pub fn release_pool(&mut self, name: &[u8]) -> bool {
+        if name.len() >= 64 || name.len() <= 0 {
+            return false;
+        }
+
+        if name == LOG_POOL_NAME {
+            return false;
+        }
+
         unsafe {
             let total_pools = (*self.metadata).total_pools.load(Ordering::Acquire);
             for i in 0..total_pools {
@@ -390,6 +549,7 @@ impl GlobalPersistentAllocator {
                         if let Some(pool) = &mut entry.pool {
                             // Use ptr::write_volatile to write to the header's magic field
                             ptr::write_volatile(&mut (*pool.header).magic as *mut u64, 0);
+                            pool.empty_pool();
 
                             // Ensure write is flushed to persistence
                             core::arch::x86_64::_mm_sfence();
@@ -435,6 +595,8 @@ impl GlobalPersistentAllocator {
         //info!("  Final offset: 0x{:x}", offset);
         offset
     }
+
+
 
     fn compare_name(&self, name: &[u8], entry_name: &[u8; 64]) -> bool {
         let mut i = 0;
@@ -547,6 +709,13 @@ impl GlobalPersistentAllocator {
             info!("Pool directory size: {} bytes",
                 (*self.metadata).total_pools.load(Ordering::Acquire) as usize * size_of::<PoolDirectoryEntry>());
             info!("Bitmap words: {}", (*self.metadata).bitmap_words);
+
+            info!("=== Log Pool Information ===");
+            if let Some(log_pool_address) = self.log_pool_address {
+                info!("Log pool address: 0x{:x}", log_pool_address);
+            } else {
+                info!("Log pool not initialized");
+            }
 
             // Statistics
             info!("=== Statistics ===");

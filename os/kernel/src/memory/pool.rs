@@ -1,39 +1,46 @@
 use alloc::vec::Vec;
 use core::alloc::Layout;
-use core::any::{TypeId, type_name};
-use core::array;
+use core::any::{type_name};
 use core::mem;
 use core::ptr;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use linked_list_allocator::LockedHeap;
 use log::info;
 use crate::memory::global_persistent_allocator::qemu_exit;
+use memory::global_persistent_allocator::{FIXED_POOL_SIZE, LOG_POOL_NAME};
+use crate::memory;
+use spin::Mutex;
+
+static mut LOG_POOL: Option<Pool> = None;
+
 
 const POOL_MAGIC: u64 = 0x4433_4F53_504F4F4C; // "D3OS_POOL" in hex
 const MAX_OBJECT_ENTRIES: usize = 1024; //~88B*1024 for table
 
-// #[repr(u8)]
-// #[derive(Debug, Copy, Clone)]
-// pub enum Operation {
-//     Allocation = 1,
-//     Deallocation = 2,
-//     Modification = 3,
-//     ObjectTableUpdate = 4,
-// }
+impl From<core::alloc::LayoutError> for PoolError {
+    fn from(_: core::alloc::LayoutError) -> Self {
+        PoolError::LayoutError
+    }
+}
 
-//Dogshit
-// #[repr(C)]
-// #[derive(Debug)]
-// pub struct UndoLog {
-//     valid: AtomicBool,
-//     operation: Operation,
-//     offset: u64,// Ref to the objectTableEntry
-//     size: usize,
-//     type_hash: u64,
-//     checksum: u32,
-//     old_data: [u8; 4096],
-// }
+//For log_pool!
+#[repr(u8)]
+#[derive(Copy, Clone)]
+enum OperationType {
+    Allocation,
+    Modification,
+    Deallocation,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct LoggedOperation {
+    op_type: OperationType,
+    original_pool_offset: u64,
+    data_size: usize,
+    type_hash: u64,
+}
 
 #[repr(C)]
 pub struct ObjectTableEntry {
@@ -72,27 +79,33 @@ pub enum PoolError {
     InvalidId,
     ObjectTableFull,
     JournalFull,
+    InconsistentState,
+    LogPoolFull,
+    LogPoolNotAvailable,
+    LayoutError,
 }
+
 
 pub struct Pool {
     base_address: u64,
     pub(crate) header: *mut PoolHeader,
+    //pub(crate) log_pool_address: Option<u64>, // Store pointer to log pool
     object_table_offset: u64,
     heap: LockedHeap,
 }
-
-
+#[allow(static_mut_refs)]
 impl Pool {
+    //pub fn new(base: u64, size: usize, log_pool_address: Option<u64>) -> Self {
     pub fn new(base: u64, size: usize) -> Self {
-
         let header = base as *mut PoolHeader;
         let object_table_offset = align_up(mem::size_of::<PoolHeader>(), 64) as u64;
         let heap_offset = align_up(object_table_offset as usize + mem::size_of::<ObjectTableEntry>() * MAX_OBJECT_ENTRIES, 64) as u64;
         let heap_size = size - mem::size_of::<ObjectTableEntry>() * MAX_OBJECT_ENTRIES - mem::size_of::<PoolHeader>();
 
-        let mut pool = Self {
+        let pool = Self {
             base_address: base,
             header,
+            //log_pool_address,
             object_table_offset,
             heap: LockedHeap::empty(),
         };
@@ -111,16 +124,16 @@ impl Pool {
 
                 Self::flush_cache_line(header as *const _ as *const u8);
 
-                pool.heap.lock().init(
-                    (base + heap_offset as u64) as *mut u8,
-                    heap_size
-                );
             } else {
                 info!("Reusing existing pool at 0x{:x}", base);
-                //TODO: Recover
             }
+            //DOC: immer initialisieren sonst kann es zu fehlern kommen
+            //TODO: hierfür zeit messen
+            pool.heap.lock().init(
+                (base + heap_offset) as *mut u8,
+                heap_size
+            );
         }
-
         //pool.print_metadata_debug_info();
         pool
     }
@@ -130,8 +143,31 @@ impl Pool {
     where
         F: FnOnce(&mut TransactionContext) -> Result<R, PoolError>,
     {
+        if let Some(log_pool) = self.get_log_pool() {
+            let has_logs = unsafe {
+                let table_base = (log_pool.base_address + log_pool.object_table_offset)
+                    as *const ObjectTableEntry;
+
+                (0..(*log_pool.header).max_objects).any(|i| {
+                    let entry = &*table_base.add(i);
+                    entry.active.load(Ordering::Acquire) &&
+                        entry.valid.load(Ordering::Acquire)
+                })
+            };
+
+            if has_logs {
+                info!("Found logs from previous transaction, performing recovery...");
+                Self::perform_rollback(log_pool)?;
+            }
+
+            // Clear log pool for new transaction
+            log_pool.empty_pool();
+        }
+
+
         // Always check for recovery at start of transaction
-        self.recover()?;
+        //TODO: Brauche ich recover noch ? -> das hier ist bei neustart des Systems
+        //self.recover()?;
 
         let mut ctx = TransactionContext {
             pool: self,
@@ -140,6 +176,7 @@ impl Pool {
 
         match f(&mut ctx) {
             Ok(result) => {
+                info!("Transaction successful, committing changes...");
                 // Activate all changes
                 for change in ctx.pending_changes {
                     unsafe {
@@ -148,9 +185,21 @@ impl Pool {
                         Self::flush_cache_line(change.entry as *const u8);
                     }
                 }
+                // Clear log pool after successful transaction
+                if let Some(mut log_pool) = self.get_log_pool() {
+                    log_pool.empty_pool();
+                }
+
                 Ok(result)
             }
-            Err(e) => Err(e)
+            Err(e) => {
+                info!("Transaction failed, rolling back changes...");
+                if let Some(log_pool) = self.get_log_pool() {
+                    Self::perform_rollback(log_pool)?;
+                    log_pool.empty_pool();
+                }
+                Err(e)
+            }
         }
     }
 
@@ -169,6 +218,10 @@ impl Pool {
                 // 1. Active und Valid und opertion_done -> alles gut
                 // 2. Active und Valid und nicht operation_done -> nicht möglich
                 // 3. Active und nicht Valid und operation_done -> Entweder Alloc oder modify
+
+                // IDEE: Erst alle suchen und schauen ob es einen eintrag gibt der nicht operation_done ist
+                // FALLS das der Fall -> versuchen alles zu rollbacken
+                // FALLS das nicht der Fall -> alles valid setzen -> unwahrscheinlichj
                 if entry.active.load(Ordering::Acquire) && !entry.valid.load(Ordering::Acquire) {
 
                     info!("Recovering object with ID: {}", core::str::from_utf8_unchecked(&entry.id[..entry.id_len as usize]));
@@ -188,6 +241,269 @@ impl Pool {
         }
     }
 
+    fn perform_rollback(log_pool: &Pool) -> Result<(), PoolError> {
+        unsafe {
+            let table_base = (log_pool.base_address + log_pool.object_table_offset)
+                as *const ObjectTableEntry;
+
+            // Process logs in reverse order
+            for i in (0..(*log_pool.header).max_objects).rev() {
+                let entry = &*table_base.add(i);
+                if !entry.active.load(Ordering::Acquire) ||
+                    !entry.valid.load(Ordering::Acquire) {
+                    continue;
+                }
+
+                if let Some(data_ptr) = entry.data {
+                    let logged_op = &*(data_ptr.as_ptr() as *const LoggedOperation);
+                    let original_data = (data_ptr.as_ptr() as *const u8)
+                        .add(mem::size_of::<LoggedOperation>());
+
+                    match logged_op.op_type {
+                        OperationType::Allocation => {
+                            // The original_pool_offset tells us which pool this belongs to
+                            let target_addr = logged_op.original_pool_offset;
+                            // Undo allocation...
+                        },
+                        OperationType::Modification => {
+                            // Restore original data using the offset
+                            ptr::copy_nonoverlapping(
+                                original_data,
+                                (logged_op.original_pool_offset) as *mut u8,
+                                logged_op.data_size
+                            );
+                            info!("Versuche wieder valide");
+                            let target_entry = Self::find_entry_by_offset(logged_op.original_pool_offset)?;
+                            info!("Hab gefunden");
+
+                        },
+                        OperationType::Deallocation => {
+                            // For deallocation rollback, just copy the saved data back
+                            ptr::copy_nonoverlapping(
+                                original_data,
+                                (logged_op.original_pool_offset) as *mut u8,
+                                logged_op.data_size
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // fn rollback(&mut self) -> Result<(), PoolError> {
+    //     let log_pool = self.get_log_pool()
+    //         .ok_or(PoolError::LogPoolNotAvailable)?;
+    //
+    //     unsafe {
+    //         let table_base = (log_pool.base_address + log_pool.object_table_offset)
+    //             as *const ObjectTableEntry;
+    //
+    //         // Process logs in reverse order
+    //         for i in (0..(*log_pool.header).max_objects).rev() {
+    //             let entry = &*table_base.add(i);
+    //             if !entry.active.load(Ordering::Acquire) ||
+    //                 !entry.valid.load(Ordering::Acquire) {
+    //                 continue;
+    //             }
+    //
+    //             if let Some(data_ptr) = entry.data {
+    //                 let logged_op = &*(data_ptr.as_ptr() as *const LoggedOperation);
+    //                 let original_data = (data_ptr.as_ptr() as *const u8)
+    //                     .add(mem::size_of::<LoggedOperation>());
+    //
+    //                 match logged_op.op_type {
+    //                     OperationType::Allocation => {
+    //                         // Undo allocation
+    //                         let ptr = NonNull::new((self.base_address +
+    //                             logged_op.original_pool_offset) as *mut u8)
+    //                             .ok_or(PoolError::InconsistentState)?;
+    //                         self.heap.lock().deallocate(
+    //                             ptr,
+    //                             Layout::from_size_align(logged_op.data_size, 8)?
+    //                         );
+    //                     },
+    //                     OperationType::Modification => {
+    //                         // Restore original data
+    //                         ptr::copy_nonoverlapping(
+    //                             original_data,
+    //                             (self.base_address + logged_op.original_pool_offset) as *mut u8,
+    //                             logged_op.data_size
+    //                         );
+    //                     },
+    //                     OperationType::Deallocation => {
+    //                         // Restore deallocated data
+    //                         let layout = Layout::from_size_align(logged_op.data_size, 8)?;
+    //                         if let Ok(ptr) = self.heap.lock().allocate_first_fit(layout) {
+    //                             ptr::copy_nonoverlapping(
+    //                                 original_data,
+    //                                 ptr.as_ptr(),
+    //                                 logged_op.data_size
+    //                             );
+    //                         }
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }
+    //     Ok(())
+    // }
+
+    unsafe fn find_entry_by_offset(offset: u64) -> Result<*mut ObjectTableEntry, PoolError> {
+        // We need to find the pool that contains this offset
+        // This could be improved with a more efficient lookup mechanism
+        let pool_base = offset & !(FIXED_POOL_SIZE as u64 - 1);
+        let pool = &*(pool_base as *const Pool);
+
+        let table_base = (pool.base_address + pool.object_table_offset)
+            as *mut ObjectTableEntry;
+
+        // Search through entries
+        for i in 0..(*pool.header).max_objects {
+            let entry = &mut *table_base.add(i);
+            if let Some(data) = entry.data {
+                if data.as_ptr() as u64 == offset {
+                    return Ok(table_base.add(i));
+                }
+            }
+        }
+
+        Err(PoolError::InvalidId)
+    }
+
+
+    pub(crate) fn get_log_pool(&self) -> Option<&mut Pool> {
+        if self.is_log_pool() {
+            return None;
+        }
+
+        // Safety: We ensure single-threaded access in our early-stage OS
+        unsafe { LOG_POOL.as_mut() }
+    }
+
+    pub(crate) fn init_log_pool(base_address: u64) {
+        // Safety: This is only called once during initialization
+        unsafe {
+            LOG_POOL = Some(Pool::new(base_address, FIXED_POOL_SIZE));
+        }
+    }
+
+    // Helper to check if log pool is initialized
+    pub fn is_log_pool_initialized() -> bool {
+        unsafe { LOG_POOL.is_some() }
+    }
+
+    fn is_log_pool(&self) -> bool {
+        unsafe {
+            let table_base = (self.base_address + (*self.header).object_table_offset)
+                as *const ObjectTableEntry;
+
+            // Check the first entry for LOG_POOL_NAME
+            let entry = &*table_base;
+            if entry.active.load(Ordering::Acquire) {
+                let entry_id = core::str::from_utf8_unchecked(
+                    &entry.id[..entry.id_len as usize]
+                );
+                return entry_id == core::str::from_utf8_unchecked(LOG_POOL_NAME);
+            }
+            false
+        }
+    }
+
+    unsafe fn allocate_raw(&self, size: usize) -> Result<(*mut u8, *mut ObjectTableEntry), PoolError> {
+        info!("Allocating {} bytes in pool at 0x{:x}", size, self.base_address);
+
+        //DOC: Doublecheck if heap is correct
+
+        // Ensure heap is initialized
+        if self.heap.lock().bottom() == 0 as *mut u8 {
+            let heap_offset = (*self.header).heap_start;
+            self.heap.lock().init(
+                (self.base_address + heap_offset) as *mut u8,
+                (*self.header).heap_size
+            );
+        }
+
+        let table_base = (self.base_address + self.object_table_offset) as *mut ObjectTableEntry;
+
+        // Find free entry
+        for i in 0..(*self.header).max_objects {
+            let entry = &mut *table_base.add(i);
+            if !entry.active.load(Ordering::Acquire) {
+                // Allocate memory
+                info!("Found free entry at index {}", i);
+                let layout = Layout::from_size_align(size, 8)?;
+
+                match self.heap.lock().allocate_first_fit(layout) {
+                    Ok(ptr) => {
+                        // Setup entry
+                        entry.active.store(true, Ordering::Release);
+                        entry.valid.store(true, Ordering::Release);
+                        entry.data = Some(ptr);
+
+                        return Ok((ptr.as_ptr(), entry));
+                    },
+                    Err(e) => {
+                        info!("Allocation failed in pool at 0x{:x}: {:?}", self.base_address, e);
+                        return Err(PoolError::AllocationFailed);
+                    }
+                }
+            }
+        }
+
+        info!("No free entries found in pool at 0x{:x}", self.base_address);
+        Err(PoolError::ObjectTableFull)
+    }
+
+    fn log_operation(&self, op_type: OperationType, offset: u64, data: *const u8, size: usize, type_hash: u64) -> Result<(), PoolError> {
+        let log_pool = self.get_log_pool()
+            .ok_or(PoolError::LogPoolNotAvailable)?;
+
+        unsafe {
+            info!("Logging operation at offset 0x{:x}", offset);
+            let total_size = size_of::<LoggedOperation>() + size;
+            let (ptr, _entry) = log_pool.allocate_raw(total_size)?;
+            info!("Raw Allocation done");
+
+            // Initialize log entry
+            let log_entry = &mut *(ptr as *mut LoggedOperation);
+            *log_entry = LoggedOperation {
+                op_type,
+                original_pool_offset: offset,
+                data_size: size,
+                type_hash,
+            };
+
+            // Copy original data after the LoggedOperation structure
+            if !data.is_null() {
+                ptr::copy_nonoverlapping(
+                    data,
+                    ptr.add(size_of::<LoggedOperation>()),
+                    size
+                );
+            }
+
+            Self::flush_cache_line(ptr as *const u8);
+            if !data.is_null() {
+                Self::flush_cache_line(ptr.add(size_of::<LoggedOperation>()));
+            }
+        }
+        Ok(())
+    }
+
+    fn log_allocation(&self, offset: u64, size: usize, type_hash: u64) -> Result<(), PoolError> {
+        self.log_operation(OperationType::Allocation, offset, ptr::null(), size, type_hash)
+    }
+
+    fn log_modification(&self, offset: u64, data: *const u8, size: usize, type_hash: u64) -> Result<(), PoolError> {
+        self.log_operation(OperationType::Modification, offset, data, size, type_hash)
+    }
+
+    fn log_deallocation(&self, offset: u64, data: *const u8, size: usize, type_hash: u64) -> Result<(), PoolError> {
+        self.log_operation(OperationType::Deallocation, offset, data, size, type_hash)
+    }
+
     fn compute_type_hash<T: 'static>() -> u64 {
         // Simple hash computation
         let mut hash = 5381u64;
@@ -204,6 +520,63 @@ impl Pool {
             core::arch::x86_64::_mm_clflush(ptr);
             core::arch::x86_64::_mm_sfence();
         }
+    }
+
+    pub fn empty_pool(&mut self) {
+        info!("Emptying pool at 0x{:x}", self.base_address);
+
+        unsafe {
+            let table_base = (self.base_address + (*self.header).object_table_offset)
+                as *mut ObjectTableEntry;
+
+            // First mark all entries as inactive
+            for i in 0..(*self.header).max_objects {
+                let entry = &mut *table_base.add(i);
+                if entry.active.load(Ordering::Acquire) {
+                    info!("Found active entry #{}", i);
+                    // First mark as inactive
+                    entry.active.store(false, Ordering::Release);
+                    entry.valid.store(false, Ordering::Release);
+                    entry.operation_done.store(false, Ordering::Release);
+                    //TODO: FLASH NOCH HINBAUEN
+                    //Self::flush_cache_line(entry as *const u8);
+                }
+            }
+
+            // Then reinitialize the heap
+            let heap_offset = (*self.header).heap_start;
+            let heap_size = (*self.header).heap_size;
+
+            // Create new heap instance instead of reusing
+            self.heap = LockedHeap::empty();
+            self.heap.lock().init(
+                (self.base_address + heap_offset) as *mut u8,
+                heap_size
+            );
+        }
+        // info!("Emptying pool at 0x{:x}", self.base_address);
+        // unsafe {
+        //     let table_base = (self.base_address + (*self.header).object_table_offset)
+        //         as *mut ObjectTableEntry;
+        //
+        //     for i in 0..(*self.header).max_objects {
+        //         if (*table_base.add(i)).active.load(Ordering::Acquire) {
+        //             info!("Emptying entry #{}", i);
+        //             if let Some(ptr) = (*table_base.add(i)).data {
+        //                 info!("Deallocating data at 0x{:x}", ptr.as_ptr() as u64);
+        //                 self.heap.lock().deallocate(
+        //                     ptr,
+        //                     Layout::from_size_align((*table_base.add(i)).type_size, 8)
+        //                         .map_err(|_| PoolError::AllocationFailed)
+        //                         .unwrap()
+        //                 );
+        //             }
+        //             (*table_base.add(i)).active.store(false, Ordering::Release);
+        //             (*table_base.add(i)).valid.store(false, Ordering::Release);
+        //             (*table_base.add(i)).operation_done.store(false, Ordering::Release);
+        //         }
+        //     }
+        // }
     }
 
     unsafe fn deallocate(&mut self, ptr: NonNull<u8>, layout: Layout) {
@@ -252,9 +625,34 @@ impl Pool {
             }
         }
     }
+
+    pub fn debug_log_pool_state(&self) {
+        if let Some(log_pool) = self.get_log_pool() {
+            info!("=== Log Pool State ===");
+            info!("Log Pool Base Address: 0x{:x}", log_pool.base_address);
+
+            unsafe {
+                let table_base = (log_pool.base_address + log_pool.object_table_offset)
+                    as *const ObjectTableEntry;
+
+                let mut active_entries = 0;
+                for i in 0..(*log_pool.header).max_objects {
+                    let entry = &*table_base.add(i);
+                    if entry.active.load(Ordering::Acquire) {
+                        active_entries += 1;
+                        info!("Active Entry #{}: {:?}", i, entry.data);
+                    }
+                }
+                info!("Total Active Entries: {}", active_entries);
+            }
+            info!("====================");
+        } else {
+            info!("No log pool available or this is the log pool");
+        }
+    }
 }
 
-//TODO: Wichtig für Thesis später
+//DOC: Wichtig für Thesis später
 // Track changes within a transaction
 // THIS IS ON THE DRAM !!!!!!!
 struct PendingChange {
@@ -271,7 +669,7 @@ impl<'a> TransactionContext<'a> {
 
     pub fn allocate_with_id<T: Copy + 'static>(&mut self, id: &str, data: T) -> Result<NonNull<T>, PoolError> {
 
-        if id.len() >32 {
+        if id.len() > 32 {
             return Err(PoolError::InvalidId);
         }
 
@@ -314,31 +712,33 @@ impl<'a> TransactionContext<'a> {
             entry.type_hash = Pool::compute_type_hash::<T>();
             entry.type_size = mem::size_of::<T>();
 
-            // Single flush for metadata
             Pool::flush_cache_line(entry as *const _ as *const u8);
 
-            //  TODO: Layout anpassen!
-            // Allocate and write data
+            //TODO: LAYOUT EVLT NOCH ANPASSEN
             let ptr = self.pool.heap.lock()
                 .allocate_first_fit(Layout::new::<T>())
                 .map_err(|_| PoolError::AllocationFailed)?;
 
+            //DOC: Log the allocation BEFORE making it visible
+            info!("Starting to Allocate in Log");
+            self.pool.log_allocation(
+                (ptr.as_ptr() as u64) - self.pool.base_address,
+                mem::size_of::<T>(),
+                Pool::compute_type_hash::<T>()
+            )?;
+            //DOC: END
+
+            info!("Allocation in Log done");
+
             entry.data = Some(ptr);
-
-
             ptr::write(ptr.as_ptr() as *mut T, data);
-
-            // Single flush for data
             Pool::flush_cache_line(ptr.as_ptr() as *const u8);
 
-            // Activate entry
+            // Mark as active but not yet valid (valid happens at transaction commit)
             entry.active.store(true, Ordering::Release);
             entry.operation_done.store(true, Ordering::Release);
-
-            // Final flush for activation
             Pool::flush_cache_line(entry as *const _ as *const u8);
 
-            // Add to pending changes
             self.pending_changes.push(PendingChange {
                 entry,
                 data_ptr: ptr,
@@ -350,6 +750,7 @@ impl<'a> TransactionContext<'a> {
 
     pub fn get_by_id<T: Copy + 'static>(&self, id: &str) -> Result<NonNull<T>, PoolError> {
         unsafe {
+            info!("Looking for ID: {}", id);
             let table_base = (self.pool.base_address + (*self.pool.header).object_table_offset)
                 as *const ObjectTableEntry;
 
@@ -360,6 +761,7 @@ impl<'a> TransactionContext<'a> {
                 if !entry.active.load(Ordering::Acquire) || !entry.valid.load(Ordering::Acquire) {
                     continue;
                 }
+
 
                 let entry_id = core::str::from_utf8_unchecked(
                     &entry.id[..entry.id_len as usize]
@@ -389,7 +791,7 @@ impl<'a> TransactionContext<'a> {
         }
     }
 
-    pub fn modify<T: Copy>(
+    pub fn modify<T: Copy+ 'static>(
         &mut self,
         ptr: NonNull<T>,
         f: impl FnOnce(&mut T),
@@ -429,6 +831,17 @@ impl<'a> TransactionContext<'a> {
             (*entry).operation_done.store(false, Ordering::Release);
             Pool::flush_cache_line(entry as *const _ as *const u8);
 
+            //DOC: Log the modification BEFORE making it visible
+            info!("Starting to Modify in Log");
+            self.pool.log_modification(
+                (ptr.as_ptr() as u64) - self.pool.base_address,
+                ptr.as_ptr() as *const u8,
+                mem::size_of::<T>(),
+                Pool::compute_type_hash::<T>()
+            )?;
+            //DOC: END
+            info!("Modification in Log done");
+
             //  TODO: HIER NOCHMAL über cacheflush nachdenken!
             // Modify data
             f(&mut *ptr.as_ptr());
@@ -448,7 +861,7 @@ impl<'a> TransactionContext<'a> {
         }
     }
 
-    //TODO: Ungeprüft
+//TODO: LOGGING HINZUFÜGEN
     pub fn deallocate_by_id(&mut self, id: &str) -> Result<(), PoolError> {
         unsafe {
             let table_base = (self.pool.base_address + (*self.pool.header).object_table_offset)
@@ -464,6 +877,17 @@ impl<'a> TransactionContext<'a> {
                 if entry_id == id {
                     // First deallocate the memory
                     entry.operation_done.store(false, Ordering::Release);
+
+                    //DOC: Log the deallocation BEFORE making it visible
+                    if let Some(ptr) = entry.data {
+                        self.pool.log_deallocation(
+                            (ptr.as_ptr() as u64) - self.pool.base_address,
+                            ptr.as_ptr(),
+                            entry.type_size,
+                            entry.type_hash
+                        )?;
+                    }
+                    //DOC: END
 
                     if let Some(ptr) = entry.data {
                         self.pool.heap.lock().deallocate(
@@ -492,8 +916,6 @@ impl<'a> TransactionContext<'a> {
             Err(PoolError::InvalidId)
         }
     }
-
-
 }
 
 fn align_up(addr: usize, align: usize) -> usize {
