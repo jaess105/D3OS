@@ -241,6 +241,8 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             //     }
             // }
 
+
+
             let nvram_base = range.as_phys_frame_range().start.start_address().as_u64();
             let nvram_size = (range.as_phys_frame_range().end - range.as_phys_frame_range().start)
                 as usize * PAGE_SIZE;
@@ -278,7 +280,8 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             //     Err(e) => info!("Error: {:?}", e),
             // }
 
-            // let pool = allocator.get_or_create_pool(b"SIMON").unwrap();
+
+            let pool = allocator.get_or_create_pool(b"SIMON").unwrap();
             // pool.transaction(|tx| {
             //     match tx.get_by_id::<u64>("test") {
             //         Err(PoolError::InvalidId) => info!("Worked"),
@@ -290,24 +293,37 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
 
             //NEW TEST
 
-            //run_all_tests(&mut allocator);
+            run_all_tests(&mut allocator);
             //test_full_usage_allocator(&mut allocator);
             test_crash_recovery(&mut allocator);
 
 
-            // let pool = allocator.get_or_create_pool(b"SIMON").unwrap();
+            // let pool = allocator.get_or_create_pool(b"RECOVERY_TEST").unwrap();
+            // //
+            // pool.transaction(|tx| {
+            //     tx.allocate_with_id("asd", 57005u64)?;
+            //     tx.allocate_with_id("asd2", 48879u64)?;
+            //     Ok(())
             //
+            // }).expect("Failed");
+
+
+
+
+
+
             // match pool.transaction(|tx| {
-            //     let a = tx.allocate_with_id("data", 4660u64)?;
+            //     let a = tx.get_by_id::<u64>("data")?;
             //     tx.modify(a, |n| *n += 1)?;
-            //
+            //     //tx.allocate_with_id("data", 48879u64)?;
+            //     //qemu_exit(123);
             //     Ok(())
             // }) {
             //     Ok(_) => info!("Transaction successful"),
             //     Err(e) => info!("Transaction failed: {:?}", e),
             // }
-            //
-            // pool.debug_print_object_table();
+
+
 
             //measure_performance(pool);
             //test_recovery_scenarios(pool);
@@ -818,9 +834,9 @@ fn test_full_usage_allocator(allocator: &mut GlobalPersistentAllocator) {
 }
 
 fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
-    info!("=== Testing Crash Recovery ===");
+    // info!("=== Testing Crash Recovery ===");
     let pool = allocator.get_or_create_pool(b"RECOVERY_TEST").unwrap();
-
+    //
     // 1. Test recovery after allocation crash
     info!("Test 1: Recovery after allocation crash");
     pool.transaction(|tx| {
@@ -839,6 +855,12 @@ fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
         Ok(())
     }).expect("Recovery verification failed");
 
+    pool.transaction(|tx| {
+        tx.allocate_with_id("mytest", 4225u64)?;
+        Ok(())
+    }).expect("Initial allocation failed");
+
+    pool.debug_print_object_table();
 
     // 2. Test recovery after modification crash
     info!("Test 2: Recovery after modification crash");
@@ -854,13 +876,19 @@ fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
         Err::<(), PoolError>(PoolError::TransactionFailed)
     }).expect_err("Transaction should fail");
 
+    info!("Verify recovery");
+
+
     //Verify recovery
     pool.transaction(|tx| {
         let obj = tx.read_by_id::<SmallObject>("recover2")?;
         assert!(!obj.active, "Recovery failed - modification persisted after rollback");
+        info!("obj status: {}", obj.active);
         info!("Recovery successful - modification properly rolled back");
         Ok(())
     }).expect("Recovery verification failed");
+
+    pool.debug_print_object_table();
 
     // 3. Test recovery after deallocation crash
     info!("Test 3: Recovery after deallocation crash");
@@ -918,7 +946,7 @@ fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
     //         id: 6,
     //         data: [42; 1024 * 4],
     //     })?;
-    //     unsafe { qemu_exit(1); } // Simulate sudden power loss
+    //     //unsafe { qemu_exit(1); } // Simulate sudden power loss
     //     Ok(())
     // }).ok(); // We don't expect this to complete
     //

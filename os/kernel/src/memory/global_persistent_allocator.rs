@@ -210,20 +210,14 @@ impl GlobalPersistentAllocator {
                         Err(e) => panic!("Failed to create LOG pool: {:?}", e),
                     }
                 } else {
-                    // if (*metadata).log_pool_offset != 0 {
-                    //     // Restore log pool pointer from metadata
-                    //     //TODO: FALLS JETZT ALLOC NICHT MEHR GEHT ? EGAL
-                    //    allocator.log_pool_address = Some(base_address + (*metadata).log_pool_offset);
-                    //
-                    // } else {
-                    //     panic!("Invalid metadata: log pool offset is 0");
-                    // }
                     if (*metadata).log_pool_offset != 0 {
-                        // Restore static log pool
+                        // Restore log pool pointer from metadata
                         Pool::init_log_pool(base_address + (*metadata).log_pool_offset);
+
                     } else {
                         panic!("Invalid metadata: log pool offset is 0");
                     }
+
 
                     info!("Recovery check successful: {:?}", status);
                     // Verify configuration
@@ -334,6 +328,7 @@ impl GlobalPersistentAllocator {
                     // Check if this is our pool
                     if self.compare_name(name, &entry.name) {
                         if let Some(pool) = &mut entry.pool {
+                            info!("Pool already exists");
                             return Ok(pool);
                         }
                     }
