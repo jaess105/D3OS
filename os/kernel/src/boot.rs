@@ -259,59 +259,15 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             let mut allocator = persistent_allocator().write();
 
 
-            //allocator.print_bitmap();
-            //allocator.release_pool(b"SIMON");
-            // allocator.release_pool(b"SIMON");
-            // allocator.release_pool(b"POOL1");
-            //
-            // match allocator.get_or_create_pool(b"SIMON") {
-            //
-            //     Ok(pool) => {
-            //         info!("Pool created/found successfully");
-            //         pool.debug_print_object_table();
-            //         pool.transaction(|tx| {
-            //             tx.allocate_with_id("test", 42u64)?;
-            //             qemu_exit(123);
-            //             Ok(())
-            //         }).expect("Failed");
-            //
-            //
-            //     }
-            //     Err(e) => info!("Error: {:?}", e),
-            // }
-
-
-            let pool = allocator.get_or_create_pool(b"SIMON").unwrap();
-            // pool.transaction(|tx| {
-            //     match tx.get_by_id::<u64>("test") {
-            //         Err(PoolError::InvalidId) => info!("Worked"),
-            //         _ => info!("Failed")
-            //     }
-            //     Ok(())
-            // }).expect("Failed");
-
-
-            //NEW TEST
-
-            run_all_tests(&mut allocator);
+            //run_all_tests(&mut allocator);
             //test_full_usage_allocator(&mut allocator);
-            test_crash_recovery(&mut allocator);
+            //test_crash_recovery(&mut allocator);
+
 
 
             // let pool = allocator.get_or_create_pool(b"RECOVERY_TEST").unwrap();
-            // //
-            // pool.transaction(|tx| {
-            //     tx.allocate_with_id("asd", 57005u64)?;
-            //     tx.allocate_with_id("asd2", 48879u64)?;
-            //     Ok(())
+            // // pool.debug_print_object_table()
             //
-            // }).expect("Failed");
-
-
-
-
-
-
             // match pool.transaction(|tx| {
             //     let a = tx.get_by_id::<u64>("data")?;
             //     tx.modify(a, |n| *n += 1)?;
@@ -322,82 +278,6 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             //     Ok(_) => info!("Transaction successful"),
             //     Err(e) => info!("Transaction failed: {:?}", e),
             // }
-
-
-
-            //measure_performance(pool);
-            //test_recovery_scenarios(pool);
-
-            // match pool.transaction(|tx| {
-            //     //let rec = tx.get_by_id::<u64>("recover_test")?;
-            //     //tx.deallocate_by_id("recover_test")?;
-            //     Ok(())
-            // }) {
-            //     Ok(_) => info!("Transaction successful"),
-            //     Err(e) => info!("Transaction failed: {:?}", e),
-            // }
-
-            //Testing Deallocation
-
-            // match pool.transaction(|tx| {
-            //     tx.allocate_with_id("allocated", 42u64)?;
-            //     //tx.deallocate_by_id("allocated2")?;
-            //     tx.allocate_with_id("allocated3", 4660u64)?;
-            //     tx.allocate_with_id("allocated2", 48879u64)?;
-            //     Ok(())
-            // }) {
-            //     Ok(_) => info!("Transaction successful"),
-            //     Err(e) => info!("Transaction failed: {:?}", e),
-            // }
-
-
-
-
-            //OLD STUFF
-            // #[derive(Copy, Clone)]
-            // struct Person {
-            //     age: u32,
-            //     active: bool,
-            //     name: [u8; 5],
-            // }
-            //
-            // //datastuct with 1 mb size
-            // #[derive(Copy, Clone)]
-            // struct Data {
-            //     data: [u8; (1024 * 1024)/2],
-            // }
-            //
-            // pool.transaction(|tx| {
-            //     //tx.allocate_with_id("data", 4660u64).expect("TODO: panic message");
-            //     //tx.allocate_with_id("data", 48879u64)?;
-            //     //tx.allocate_with_id("data", 45054u64)?;
-            //     info!("About to allocate 1mb");
-            //     //Allocate 1 mb
-            //     //tx.allocate_with_id("1mb", ).expect("TODO: panic message");
-            //
-            //     // Debug print after modification
-            //
-            //     // tx.allocate_with_id("person1", Person {
-            //     //     name: *b"Simon",
-            //     //     age: 25,
-            //     //     active: false,
-            //     // }).expect("TODO: panic message");
-            //
-            //     //tx.allocate_with_id("data1", 1234u64)?;
-            //     //qemu_exit(123);
-            //     Ok(())
-            // }).expect("TODO: panic message");
-            //
-            // // pool.transaction(|tx| {
-            // //     tx.allocate_with_id("data", 48879u64).expect("TODO: panic message");
-            // //
-            // //
-            // //     let mydata = tx.get_by_id::<u64>("data")?;
-            // //
-            // //     Ok(())
-            // // }).expect("TODO: panic message");
-            //
-            // allocator.get_or_create_pool(b"SIMON2").unwrap();
 
         }
     }
@@ -703,10 +583,11 @@ fn test_multiple_pools(allocator: &mut GlobalPersistentAllocator) {
 
     // Test Pool 3
     //DOC: wiederverwendbar
+    //TODO: Auch matchen:D gerade kb
     {
         allocator.release_pool(b"POOL1");
         let pool3 = allocator.get_or_create_pool(b"POOL3").unwrap();
-        pool3.debug_print_object_table();
+        //pool3.debug_print_object_table();
     }
 
 
@@ -753,51 +634,49 @@ fn test_type_safety(allocator: &mut GlobalPersistentAllocator) {
 fn measure_performance_time(allocator: &mut GlobalPersistentAllocator) {
     info!("=== Performance Tests ===");
 
-    // Get timer reference
-    let timer = crate::timer();
-
     // Measure pool creation
-    let start_ms = timer.systime_ms();
+    let start1 = unsafe { _rdtsc() };
     let pool = allocator.get_or_create_pool(b"PERF_TEST").unwrap();
-    let time_taken = timer.systime_ms() - start_ms;
-    info!("Pool creation: {} ms", time_taken);
+    let end1 = unsafe { _rdtsc() };
+    info!("Pool creation: {} tsc", end1 - start1);
 
     // Measure single small allocation
-    let start_ms = timer.systime_ms();
+
     pool.transaction(|tx| {
+        let start2 = unsafe { _rdtsc() };
         tx.allocate_with_id("single", 42u64)?;
+        let end2 = unsafe { _rdtsc() };
+        info!("Single allocation 8bytes : {} tsc", end2 - start2);
         Ok(())
     }).expect("Single allocation failed");
-    let time_taken = timer.systime_ms() - start_ms;
-    info!("Single allocation: {} ms", time_taken);
 
     // Measure bulk allocations
-    let start_ms = timer.systime_ms();
     pool.transaction(|tx| {
+        let start3 = unsafe { _rdtsc() };
         for i in 0..100 {
             tx.allocate_with_id(&format!("bulk{}", i), i as u64)?;
         }
+        let end3 = unsafe { _rdtsc() };
+        info!("100 allocations: {} tsc (avg: {} tsc per allocation)",
+        end3-start3, (end3-start3) as f64 / 100.0
+    );
         Ok(())
     }).expect("Bulk allocation failed");
-    let time_taken = timer.systime_ms() - start_ms;
-    info!("100 allocations: {} ms (avg: {} ms per allocation)",
-        time_taken,
-        time_taken as f64 / 100.0
-    );
+
 
     // Measure large allocation
-    let start_ms = timer.systime_ms();
     pool.transaction(|tx| {
+        let start4 = unsafe { _rdtsc() };
         tx.allocate_with_id("large", LargeObject {
             id: 1,
             data: [0; 4096]
         })?;
+        let end4 = unsafe { _rdtsc() };
+        info!("4KB allocation: {} tsc", end4 - start4);
         Ok(())
     }).expect("Large allocation failed");
-    let time_taken = timer.systime_ms() - start_ms;
-    info!("4KB allocation: {} ms", time_taken);
-}
 
+}
 
 // Main test runner
 fn run_all_tests(allocator: &mut GlobalPersistentAllocator) {
@@ -888,7 +767,6 @@ fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
         Ok(())
     }).expect("Recovery verification failed");
 
-    pool.debug_print_object_table();
 
     // 3. Test recovery after deallocation crash
     info!("Test 3: Recovery after deallocation crash");
@@ -921,8 +799,7 @@ fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
     pool.transaction(|tx| {
         // Multiple operations in one transaction
         tx.allocate_with_id("multi1", SmallObject { id: 4, active: true })?;
-        tx.allocate_with_id("multi2", SmallObject { id: 5, active: false })?;
-        let ptr = tx.get_by_id::<SmallObject>("multi2")?;
+        let ptr = tx.allocate_with_id("multi2", SmallObject { id: 5, active: false })?;
         tx.modify(ptr, |obj| obj.active = true)?;
         tx.deallocate_by_id("multi1")?;
         // Simulate crash
@@ -939,6 +816,8 @@ fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
         Ok(())
     }).expect("Recovery verification failed");
 
+    pool.debug_print_object_table();
+
     // // 5. Test system crash recovery (simulate power loss)
     // info!("Test 5: System crash recovery");
     // pool.transaction(|tx| {
@@ -952,15 +831,6 @@ fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
     //
     // // In real system, this would be after restart
     // // Here we just create a new pool instance
-    // let pool = allocator.get_or_create_pool(b"RECOVERY_TEST").unwrap();
-    // pool.transaction(|tx| {
-    //     match tx.get_by_id::<LargeObject>("crash") {
-    //         Err(PoolError::InvalidId) => info!("Crash recovery successful - incomplete transaction rolled back"),
-    //         Ok(_) => panic!("Crash recovery failed - incomplete transaction persisted"),
-    //         Err(e) => panic!("Unexpected error during crash recovery: {:?}", e),
-    //     }
-    //     Ok(())
-    // }).expect("Crash recovery verification failed");
 }
 
 // fn test_concurrent_recovery(allocator: &mut GlobalPersistentAllocator) {

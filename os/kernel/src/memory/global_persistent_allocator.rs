@@ -227,7 +227,7 @@ impl GlobalPersistentAllocator {
 
             }
         }
-        allocator.print_metadata_debug_info();
+        //allocator.print_metadata_debug_info();
         allocator
     }
 
@@ -367,7 +367,7 @@ impl GlobalPersistentAllocator {
             };
             ptr::copy_nonoverlapping(name.as_ptr(), new_entry.name.as_mut_ptr(), name.len());
             new_entry.name[name.len()] = 0;
-            info!("Created new Pool wiht logpool: {:?}", self.log_pool_address);
+            info!("Created new Pool with ID {}", core::str::from_utf8(name).unwrap());
 
             // Batch update metadata counters
             let metadata = &*self.metadata;
