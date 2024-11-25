@@ -131,8 +131,7 @@ impl Pool {
             } else {
                 info!("Reusing existing pool at 0x{:x}", base);
             }
-            //DOC: immer initialisieren sonst kann es zu fehlern kommen
-            //TODO: hierfür zeit messen
+
             pool.heap.lock().init(
                 (base + heap_offset) as *mut u8,
                 heap_size
@@ -163,10 +162,10 @@ impl Pool {
             if has_logs {
                 info!("Systemcrash happend, clearing log");
                 //Self::perform_rollback(log_pool)?;
-                log_pool.empty_log_pool();
+                //log_pool.empty_log_pool();
             }
-        //
-        //     // Clear log pool for new transaction
+
+            // Clear log pool for new transaction
             // log_pool.empty_log_pool();
          }
 
@@ -192,7 +191,7 @@ impl Pool {
                 }
                 // Clear log pool after successful transaction
                 if let Some(mut log_pool) = self.get_log_pool() {
-                    log_pool.empty_pool();
+                    Self::empty_log_pool(log_pool.base_address);
                 }
 
                 Ok(result)
@@ -200,8 +199,8 @@ impl Pool {
             Err(e) => {
                 info!("Transaction failed, rolling back changes");
                 if let Some(log_pool) = self.get_log_pool() {
-                    Self::perform_rollback(log_pool)?;
-                    log_pool.empty_pool();
+                    Self::perform_rollback(log_pool.base_address)?;
+                    Self::empty_log_pool(log_pool.base_address);
                 }
                 Err(e)
             }
@@ -314,22 +313,34 @@ impl Pool {
         }
     }
 
-    fn perform_rollback(log_pool: &Pool) -> Result<(), PoolError> {
+    // pub(crate) fn perform_rollback(log_pool: &mut Pool) -> Result<(), PoolError> {
+    pub(crate) fn perform_rollback(pool_base: u64) -> Result<(), PoolError> {
         unsafe {
-            let table_base = (log_pool.base_address + log_pool.object_table_offset)
-                as *const ObjectTableEntry;
+
+            let header = pool_base as *const PoolHeader;
+
+
+            let table_base = (pool_base + (*header).object_table_offset)
+                as *mut ObjectTableEntry;
+
+            // let table_base = (log_pool.base_address + log_pool.object_table_offset)
+            //     as *const ObjectTableEntry;
 
             // Process logs in reverse order
-            for i in (0..(*log_pool.header).max_objects).rev() {
+            for i in (0..MAX_OBJECT_ENTRIES).rev() {
                 let entry = &*table_base.add(i);
                 if !entry.active.load(Ordering::Acquire) ||
                     !entry.valid.load(Ordering::Acquire) {
                     continue;
                 }
 
+
+
                 if let Some(data_ptr) = entry.data {
                     let logged_op = &*(data_ptr.as_ptr() as *const LoggedOperation);
                     let original_data = (data_ptr.as_ptr() as *const u8).add(mem::size_of::<LoggedOperation>());
+
+                    info!("Rolling back operation {}", logged_op.op_type as u8);
 
                     match logged_op.op_type {
                         OperationType::Allocation => {
@@ -407,9 +418,6 @@ impl Pool {
         // Use the pool_base to find the correct pool
         let header = pool_base as *const PoolHeader;
 
-        //info!("Pool Object Table Offset: 0x{:x}", (*header).object_table_offset);
-        //info!("Pool object table now at: 0x{:x}", pool.object_table_offset);
-        //info!("now calulting : 0x{:x}", pool_base + (*header).object_table_offset);
 
         let table_base = (pool_base + (*header).object_table_offset)
             as *mut ObjectTableEntry;
@@ -613,13 +621,18 @@ impl Pool {
         }
     }
 
-    fn empty_log_pool(&mut self) {
-        info!("Emptying log pool at 0x{:x}", self.base_address);
+    //pub fn empty_log_pool(&mut self) {
+    pub fn empty_log_pool(pool_base: u64) {
+        info!("Emptying log pool at 0x{:x}", pool_base);
         unsafe {
-            let table_base = (self.base_address + (*self.header).object_table_offset)
+            // let table_base = (self.base_address + (*self.header).object_table_offset)
+            //     as *mut ObjectTableEntry;
+
+            let header = pool_base as *const PoolHeader;
+            let table_base = (pool_base + (*header).object_table_offset)
                 as *mut ObjectTableEntry;
 
-            for i in 0..(*self.header).max_objects {
+            for i in 0..MAX_OBJECT_ENTRIES {
                 if (*table_base.add(i)).active.load(Ordering::Acquire) {
                     let entry = &mut *table_base.add(i);
                     // if let Some(ptr) = (*table_base.add(i)).data {
@@ -660,21 +673,22 @@ impl Pool {
             }
 
             //Fully Zero the logpoolHeap
-            let heap_offset = (*self.header).heap_start;
-            let heap_size = (*self.header).heap_size;
+            let heap_offset = (*header).heap_start;
+            let heap_size = (*header).heap_size;
 
             ptr::write_bytes(
-                (self.base_address + heap_offset) as *mut u8,
+                (pool_base + heap_offset) as *mut u8,
                 0,
                 heap_size
             );
 
             //init the new heap
-            self.heap = LockedHeap::empty();
-            self.heap.lock().init(
-                (self.base_address + heap_offset) as *mut u8,
-                heap_size
-            );
+            // self.heap = LockedHeap::empty();
+            // self.heap.lock().init(
+            //     (self.base_address + heap_offset) as *mut u8,
+            //     heap_size
+            // );
+            Self::init_log_pool(pool_base);
 
         }
     }
@@ -950,8 +964,6 @@ impl<'a> TransactionContext<'a> {
             )?;
             //DOC: END
             //info!("Modification in Log done");
-
-
 
 
             // Modify data

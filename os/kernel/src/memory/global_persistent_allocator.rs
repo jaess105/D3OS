@@ -212,7 +212,14 @@ impl GlobalPersistentAllocator {
                 } else {
                     if (*metadata).log_pool_offset != 0 {
                         // Restore log pool pointer from metadata
-                        Pool::init_log_pool(base_address + (*metadata).log_pool_offset);
+                        // System Could be crashed..
+                        let log_pool_address = base_address + (*metadata).log_pool_offset;
+                        info!("Found LogPool: with address: 0x{:x}", log_pool_address);
+
+
+                        Pool::perform_rollback(log_pool_address).expect("Failed to perform rollback");
+                        Pool::empty_log_pool(log_pool_address);
+                        Pool::init_log_pool(log_pool_address);
 
                     } else {
                         panic!("Invalid metadata: log pool offset is 0");

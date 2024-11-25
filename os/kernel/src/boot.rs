@@ -264,14 +264,14 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             //test_crash_recovery(&mut allocator);
 
 
+            let pool = allocator.get_or_create_pool(b"RECOVERY_TEST").unwrap();
+            pool.debug_print_object_table()
 
-            // let pool = allocator.get_or_create_pool(b"RECOVERY_TEST").unwrap();
-            // // pool.debug_print_object_table()
-            //
             // match pool.transaction(|tx| {
-            //     let a = tx.get_by_id::<u64>("data")?;
-            //     tx.modify(a, |n| *n += 1)?;
-            //     //tx.allocate_with_id("data", 48879u64)?;
+            //     //let a = tx.get_by_id::<u64>("data")?;
+            //     //tx.modify(a, |n| *n += 1)?;
+            //     //let mut a = tx.allocate_with_id("data", 48879u64)?;
+            //
             //     //qemu_exit(123);
             //     Ok(())
             // }) {
@@ -713,7 +713,7 @@ fn test_full_usage_allocator(allocator: &mut GlobalPersistentAllocator) {
 }
 
 fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
-    // info!("=== Testing Crash Recovery ===");
+    info!("=== Testing Crash Recovery ===");
     let pool = allocator.get_or_create_pool(b"RECOVERY_TEST").unwrap();
     //
     // 1. Test recovery after allocation crash
@@ -739,9 +739,9 @@ fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
         Ok(())
     }).expect("Initial allocation failed");
 
-    pool.debug_print_object_table();
+    //pool.debug_print_object_table();
 
-    // 2. Test recovery after modification crash
+    //2. Test recovery after modification crash
     info!("Test 2: Recovery after modification crash");
     pool.transaction(|tx| {
         tx.allocate_with_id("recover2", SmallObject { id: 2, active: false })?;
@@ -766,6 +766,8 @@ fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
         info!("Recovery successful - modification properly rolled back");
         Ok(())
     }).expect("Recovery verification failed");
+
+    //pool.debug_print_object_table();
 
 
     // 3. Test recovery after deallocation crash
@@ -794,6 +796,8 @@ fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
         Ok(())
     }).expect("Recovery verification failed");
 
+    //pool.debug_print_object_table();
+
     // 4. Test recovery of multiple operations
     info!("Test 4: Recovery of multiple operations");
     pool.transaction(|tx| {
@@ -803,8 +807,12 @@ fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
         tx.modify(ptr, |obj| obj.active = true)?;
         tx.deallocate_by_id("multi1")?;
         // Simulate crash
+
         Err::<(), PoolError>(PoolError::TransactionFailed)
     }).expect_err("Transaction should fail");
+
+    //pool.debug_print_object_table();
+    //pool.debug_log_pool_state();
 
     // Verify complete rollback
     pool.transaction(|tx| {
@@ -816,77 +824,28 @@ fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
         Ok(())
     }).expect("Recovery verification failed");
 
-    pool.debug_print_object_table();
 
-    // // 5. Test system crash recovery (simulate power loss)
-    // info!("Test 5: System crash recovery");
-    // pool.transaction(|tx| {
-    //     tx.allocate_with_id("crash", LargeObject {
-    //         id: 6,
-    //         data: [42; 1024 * 4],
-    //     })?;
-    //     //unsafe { qemu_exit(1); } // Simulate sudden power loss
-    //     Ok(())
-    // }).ok(); // We don't expect this to complete
-    //
-    // // In real system, this would be after restart
-    // // Here we just create a new pool instance
 }
 
-// fn test_concurrent_recovery(allocator: &mut GlobalPersistentAllocator) {
-//     info!("=== Testing Recovery with Multiple Pools ===");
-//
-//     // Setup pools
-//     let pool1 = allocator.get_or_create_pool(b"RECOVERY_POOL1").unwrap();
-//     let pool2 = allocator.get_or_create_pool(b"RECOVERY_POOL2").unwrap();
-//
-//     // Create initial data
-//     pool1.transaction(|tx| {
-//         tx.allocate_with_id("p1_data", 42u64)?;
-//         Ok(())
-//     }).expect("Initial setup failed");
-//
-//     pool2.transaction(|tx| {
-//         tx.allocate_with_id("p2_data", 84u64)?;
-//         Ok(())
-//     }).expect("Initial setup failed");
-//
-//     // Simulate crash in pool1
-//     pool1.transaction(|tx| {
-//         tx.modify(tx.get_by_id::<u64>("p1_data")?, |v| *v = 100)?;
-//         Err::<(), PoolError>(PoolError::TransactionFailed)
-//     }).expect_err("Transaction should fail");
-//
-//     // Verify pool2 is unaffected
-//     pool2.transaction(|tx| {
-//         let value = tx.read_by_id::<u64>("p2_data")?;
-//         assert_eq!(value, 84, "Pool2 was affected by Pool1's crash");
-//         info!("Pool isolation during recovery verified");
-//         Ok(())
-//     }).expect("Pool2 verification failed");
-//
-//     // Verify pool1 recovered correctly
-//     pool1.transaction(|tx| {
-//         let value = tx.read_by_id::<u64>("p1_data")?;
-//         assert_eq!(value, 42, "Pool1 recovery failed");
-//         info!("Pool1 recovered successfully");
-//         Ok(())
-//     }).expect("Pool1 recovery verification failed");
-// }
+fn test_edge_cases(allocator: &mut GlobalPersistentAllocator) {
+    info!("=== Testing Edge Cases ===");
+    let pool = allocator.get_or_create_pool(b"EDGE_CASES").unwrap();
 
-// TODO: RECOVERY TEST
-// 2. Recovery Scenarios
-fn test_recovery_scenarios(pool: &mut Pool) {
-    // Test incomplete transaction recovery
+    //1. Alloc Delloc multiply times
     pool.transaction(|tx| {
-        tx.allocate_with_id("recover_test", 42u64)?;
-        // Simulate different crash points
-        qemu_exit(123);
+        for i in 0..100 {
+            tx.allocate_with_id(&format!("alloc{}", i), SmallObject { id: i, active: true })?;
+            tx.deallocate_by_id(&format!("alloc{}", i))?;
+        }
+        for i in 0..100 {
+
+        }
         Ok(())
-    }).expect("Recovery scenario failed");
+    }).expect("Allocation deallocation test failed");
+
 }
 
-// 3. Memory Utilization Analysis
+//OLD
 fn analyze_memory_utilization(pool: &mut Pool) {
     pool.transaction(|tx| {
         // Allocate different sized objects
