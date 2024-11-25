@@ -92,7 +92,7 @@ pub enum PoolError {
 
 
 pub struct Pool {
-    base_address: u64,
+    pub(crate) base_address: u64,
     pub(crate) header: *mut PoolHeader,
     object_table_offset: u64,
     heap: LockedHeap,
