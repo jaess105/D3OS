@@ -259,25 +259,30 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             let mut allocator = persistent_allocator().write();
 
 
-            //run_all_tests(&mut allocator);
+            run_all_tests(&mut allocator);
             //test_full_usage_allocator(&mut allocator);
-            //test_crash_recovery(&mut allocator);
+            test_crash_recovery(&mut allocator);
 
-
-            let pool = allocator.get_or_create_pool(b"RECOVERY_TEST").unwrap();
-            pool.debug_print_object_table()
-
-            // match pool.transaction(|tx| {
-            //     //let a = tx.get_by_id::<u64>("data")?;
-            //     //tx.modify(a, |n| *n += 1)?;
-            //     //let mut a = tx.allocate_with_id("data", 48879u64)?;
             //
-            //     //qemu_exit(123);
-            //     Ok(())
-            // }) {
-            //     Ok(_) => info!("Transaction successful"),
-            //     Err(e) => info!("Transaction failed: {:?}", e),
-            // }
+            let pool = allocator.get_or_create_pool(b"RECOVERY_TEST").unwrap();
+
+            //pool.debug_print_object_table();
+
+            //
+            match pool.transaction(|tx| {
+                let a = tx.get_by_id::<u64>("data")?;
+                tx.modify(a, |n| *n += 1)?;
+                //let mut a = tx.allocate_with_id("data", 48879u64)?;
+
+                //qemu_exit(123);
+                Ok(())
+            }) {
+                Ok(_) => info!("Transaction successful"),
+                Err(e) => info!("Transaction failed Correctly: {:?}", e),
+            }
+            //
+
+             //pool.debug_print_object_table();
 
         }
     }
@@ -752,6 +757,7 @@ fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
         let ptr = tx.get_by_id::<SmallObject>("recover2")?;
         tx.modify(ptr, |obj| obj.active = true)?;
         // Simulate crash during modification
+        //qemu_exit(123);
         Err::<(), PoolError>(PoolError::TransactionFailed)
     }).expect_err("Transaction should fail");
 
@@ -807,6 +813,7 @@ fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
         tx.modify(ptr, |obj| obj.active = true)?;
         tx.deallocate_by_id("multi1")?;
         // Simulate crash
+
 
         Err::<(), PoolError>(PoolError::TransactionFailed)
     }).expect_err("Transaction should fail");

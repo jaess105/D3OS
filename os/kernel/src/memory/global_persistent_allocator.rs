@@ -465,66 +465,6 @@ impl GlobalPersistentAllocator {
             }
             Err(AllocError::NoPoolsAvailable)
         }
-        // unsafe {
-        //     info!("Creating log pool");
-        //     let total_pools = (*self.metadata).total_pools.load(Ordering::Acquire);
-        //
-        //     // Find first free slot
-        //     for i in 0..total_pools as usize {
-        //         let entry = &mut *self.pool_directory.add(i);
-        //
-        //         if !self.is_bit_set(i, true) && !self.is_bit_set(i, false) {
-        //             // Calculate pool address
-        //             let pool_offset = self.get_pool_data_offset();
-        //             let pool_address = self.base_address + pool_offset +
-        //                 (i as u64 * FIXED_POOL_SIZE as u64);
-        //
-        //             info!("Creating log pool at address: 0x{:x}", pool_address);
-        //
-        //             // Create directory entry
-        //             let mut new_entry = PoolDirectoryEntry {
-        //                 name: [0; 64],
-        //                 pool: Some(Pool::new(pool_address, FIXED_POOL_SIZE, None)), // Log pool doesn't need its own log pool
-        //                 _padding: [0; 8],
-        //             };
-        //
-        //             // Copy name
-        //             ptr::copy_nonoverlapping(
-        //                 LOG_POOL_NAME.as_ptr(),
-        //                 new_entry.name.as_mut_ptr(),
-        //                 LOG_POOL_NAME.len()
-        //             );
-        //
-        //             // Set bitmap bits
-        //             self.set_bit(i, true, true);
-        //             self.set_bit(i, false, true);
-        //
-        //             // Write and persist entry
-        //             ptr::write_volatile(entry, new_entry);
-        //             core::arch::x86_64::_mm_sfence();
-        //             core::arch::x86_64::_mm_clflush(entry as *const PoolDirectoryEntry as *const u8);
-        //             core::arch::x86_64::_mm_sfence();
-        //
-        //             // Store log pool address
-        //             self.log_pool_address = Some(pool_address);
-        //
-        //             // Update metadata with log pool location
-        //             (*self.metadata).log_pool_offset = pool_address - self.base_address;
-        //
-        //             // Update metadata counters
-        //             (*self.metadata).used_pools.fetch_add(1, Ordering::Release);
-        //             (*self.metadata).initialized_pools.fetch_add(1, Ordering::Release);
-        //
-        //             // Ensure metadata is persisted
-        //             core::arch::x86_64::_mm_sfence();
-        //             core::arch::x86_64::_mm_clflush(self.metadata as *const u8);
-        //             core::arch::x86_64::_mm_sfence();
-        //
-        //             return Ok(());
-        //         }
-        //     }
-        //     Err(AllocError::NoPoolsAvailable)
-        // }
     }
 
 

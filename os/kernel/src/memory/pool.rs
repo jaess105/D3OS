@@ -160,9 +160,9 @@ impl Pool {
             };
 
             if has_logs {
-                info!("Systemcrash happend, clearing log");
-                //Self::perform_rollback(log_pool)?;
-                //log_pool.empty_log_pool();
+                info!("Systemcrash happend inside a Rollback .. Continue with rollback");
+                Self::perform_rollback(log_pool.base_address)?;
+                Self::empty_log_pool(log_pool.base_address);
             }
 
             // Clear log pool for new transaction
