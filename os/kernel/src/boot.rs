@@ -259,21 +259,23 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             let mut allocator = persistent_allocator().write();
 
 
-            //run_all_tests(&mut allocator);
+            run_all_tests(&mut allocator);
             //test_full_usage_allocator(&mut allocator);
             //test_crash_recovery(&mut allocator);
-            test_linked_list(&mut allocator);
+            //test_linked_list(&mut allocator);
 
             //
-            // let pool = allocator.get_or_create_pool(b"RECOVERY_TEST").unwrap();
+            //let pool = allocator.get_or_create_pool(b"RECOVERY_TEST").unwrap();
             //
             // //pool.debug_print_object_table();
             //
-            // //
+            //
             // match pool.transaction(|tx| {
-            //     let a = tx.get_by_id::<u64>("data")?;
-            //     tx.modify(a, |n| *n += 1)?;
-            //     //let mut a = tx.allocate_with_id("data", 48879u64)?;
+            //     //let a = tx.get_by_id::<u64>("data")?;
+            //     //tx.modify(a, |n| *n += 1)?;
+            //     let mut a = tx.allocate_with_id("data", 48879u64)?;
+            //     //tx.deallocate_by_id("data")?;
+            //
             //
             //     //qemu_exit(123);
             //     Ok(())
@@ -281,9 +283,18 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             //     Ok(_) => info!("Transaction successful"),
             //     Err(e) => info!("Transaction failed Correctly: {:?}", e),
             // }
-            //
 
-             //pool.debug_print_object_table();
+            //
+            // match pool.transaction(|tx| {
+            //     tx.get_by_id::<u64>("data")?;
+            //     Ok(())
+            // }) {
+            //     Ok(_) => info!("Transaction successful"),
+            //     Err(e) => info!("Transaction failed Correctly: {:?}", e),
+            // }
+
+
+            //pool.debug_print_object_table();
 
         }
     }
@@ -907,25 +918,6 @@ fn test_linked_list(allocator: &mut GlobalPersistentAllocator) {
             Ok(())
         }).expect("Failed to add node");
     }
-    //
-    // // 3. Test crash recovery
-    // pool.transaction(|tx| {
-    //     let list = tx.read_by_id::<LinkedList>("list")?;
-    //     info!("Current list size: {}", list.size);
-    //
-    //     // Simulate crash during node addition
-    //     let new_node = ListNode {
-    //         value: 6,
-    //         next_offset: 0,
-    //         prev_offset: list.tail_offset,
-    //     };
-    //     tx.allocate_with_id("node_6", new_node)?;
-    //
-    //     info!("Simulating crash...");
-    //     qemu_exit(123);
-    //     Ok(())
-    // }).ok();
-
 
 
     // 4. Print list (after recovery)
@@ -974,7 +966,7 @@ fn test_list_modifications(allocator: &mut GlobalPersistentAllocator) {
         // Modify and crash
         let ptr = tx.get_by_id::<ListNode>("test_node")?;
         tx.modify(ptr, |n| n.value = 100)?;
-        qemu_exit(124);
+        //qemu_exit(124);
         Ok(())
     }).ok();
 

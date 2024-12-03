@@ -1,16 +1,16 @@
-use crate::memory::pool::{Pool,};
+use crate::memory::pool::Pool;
 use core::mem;
 use core::mem::size_of;
 use core::ptr;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use log::{info,};
+use log::info;
 use x86_64::instructions::port::Port;
 
 const ALLOCATOR_MAGIC: u64 = 0x4433_4F53_4E56_4D4D; // "D3OS_NVMM"
 
-// Fixed pool size for each pool
-// DO NOT SET THIS SMALLER THAN 8Kb ! Space for metadata needed
-pub const FIXED_POOL_SIZE: usize = 1024*1024;// 1MB
+/// Fixed pool size for each pool
+/// DO NOT SET THIS SMALLER THAN 8Kb ! Space for metadata needed
+pub const FIXED_POOL_SIZE: usize = (1024 * 1024) * 2; // 1MB
 
 const BITS_PER_WORD: usize = 64;
 const METADATA_SIZE: usize = core::mem::size_of::<GlobalMetadata>();
@@ -39,8 +39,8 @@ pub(crate) struct GlobalMetadata {
 #[repr(C)]
 pub(crate) struct PoolDirectoryEntry {
     name: [u8; 64],
-    pool: Option<Pool>,  //Direct pointer to the pool
-    _padding: [u8; 8], // Adjusted padding to maintain alignment
+    pool: Option<Pool>, //Direct pointer to the pool
+    _padding: [u8; 8],  // Adjusted padding to maintain alignment
 }
 
 // Bitmap to track pool states
@@ -78,11 +78,13 @@ pub enum AllocError {
 unsafe impl Send for GlobalPersistentAllocator {}
 unsafe impl Sync for GlobalPersistentAllocator {}
 
+/// Calculates the maximum number of pools that can be created on the NVDIMM
+/// based on the available space and the fixed pool size.
+///
+/// Solve for x:
+/// nvdimm_size = METADATA_SIZE + (x * FIXED_POOL_SIZE) + (ceil(x/64) * 16) + (x * entry_size)
 fn calculate_max_pools(nvdimm_size: usize) -> usize {
     let entry_size = size_of::<PoolDirectoryEntry>();
-
-    // Solve for x:
-    // nvdimm_size = METADATA_SIZE + (x * FIXED_POOL_SIZE) + (ceil(x/64) * 16) + (x * entry_size)
 
     // Simplified approximation (slightly conservative):
     let available_space = nvdimm_size - METADATA_SIZE;
@@ -94,13 +96,17 @@ fn calculate_max_pools(nvdimm_size: usize) -> usize {
     max_pools & !(63)
 }
 
+///Calculates the maximum number of pools that can be created on the NVDIMM
+/// based on the available space and the fixed pool size.
+///
+/// This function is more precise than the calculate_max_pools function.
+/// It calculates the exact number of pools that can be created on the NVDIMM.
 fn calculate_max_pools_precise(nvdimm_size: usize) -> Option<usize> {
     // Constants for clarity
-    const MIN_REQUIRED_SIZE: usize =
-        size_of::<GlobalMetadata>() + // Minimum for metadata
+    const MIN_REQUIRED_SIZE: usize = size_of::<GlobalMetadata>() + // Minimum for metadata
             FIXED_POOL_SIZE +             // At least one pool
             size_of::<PoolDirectoryEntry>() + // One directory entry
-            16;                           // One bitmap word (for up to 64 pools)
+            16; // One bitmap word (for up to 64 pools)
 
     // Early validation
     if nvdimm_size < MIN_REQUIRED_SIZE {
@@ -111,8 +117,7 @@ fn calculate_max_pools_precise(nvdimm_size: usize) -> Option<usize> {
     let directory_entry_size = size_of::<PoolDirectoryEntry>();
 
     // Start with maximum theoretical pools
-    let mut pools = (nvdimm_size - metadata_size) /
-        (FIXED_POOL_SIZE + directory_entry_size + 1);
+    let mut pools = (nvdimm_size - metadata_size) / (FIXED_POOL_SIZE + directory_entry_size + 1);
 
     // Round down to multiple of 64 for bitmap alignment
     pools = pools & !(63);
@@ -122,11 +127,10 @@ fn calculate_max_pools_precise(nvdimm_size: usize) -> Option<usize> {
         let bitmap_words = (pools + 63) / 64;
         let bitmap_size = bitmap_words * 16; // 2 bitmaps * 8 bytes per word
 
-        let total_needed =
-            metadata_size +                    // Global metadata
+        let total_needed = metadata_size +                    // Global metadata
                 (pools * FIXED_POOL_SIZE) +       // Actual pools
                 (pools * directory_entry_size) +   // Directory entries
-                bitmap_size;                      // Bitmap space
+                bitmap_size; // Bitmap space
 
         // Add alignment padding to be extra safe
         let total_with_padding = (total_needed + 4095) & !4095; // 4KB alignment
@@ -134,7 +138,10 @@ fn calculate_max_pools_precise(nvdimm_size: usize) -> Option<usize> {
         if total_with_padding <= nvdimm_size {
             // Double-check our numbers
             debug_assert!(pools % 64 == 0, "Pools must be multiple of 64");
-            debug_assert!(total_with_padding > total_needed, "Padding calculation error");
+            debug_assert!(
+                total_with_padding > total_needed,
+                "Padding calculation error"
+            );
 
             return Some(pools);
         }
@@ -145,7 +152,6 @@ fn calculate_max_pools_precise(nvdimm_size: usize) -> Option<usize> {
     None // Could not find valid configuration
 }
 
-
 impl GlobalPersistentAllocator {
     fn check_recovery_status(&self) -> RecoveryStatus {
         unsafe {
@@ -154,7 +160,9 @@ impl GlobalPersistentAllocator {
                 bitmap_consistent: self.verify_bitmap_consistency(),
                 used_pools: (*self.metadata).used_pools.load(Ordering::Acquire),
                 total_pools: (*self.metadata).total_pools.load(Ordering::Acquire),
-                initialization_failures: (*self.metadata).initialization_failures.load(Ordering::Acquire),
+                initialization_failures: (*self.metadata)
+                    .initialization_failures
+                    .load(Ordering::Acquire),
             }
         }
     }
@@ -164,7 +172,10 @@ impl GlobalPersistentAllocator {
             panic!("Pool size too small, must be at least 8KB");
         }
 
-        info!("Trying to create a GlobalPersistentAllocator at address: 0x{:x}", base_address);
+        info!(
+            "Trying to create a GlobalPersistentAllocator at address: 0x{:x}",
+            base_address
+        );
         let metadata = base_address as *mut GlobalMetadata;
 
         //let max_pools = calculate_max_pools_precise(nvdimm_size).unwrap();
@@ -172,18 +183,18 @@ impl GlobalPersistentAllocator {
         let max_pools = calculate_max_pools(nvdimm_size);
         let bitmap_words = (max_pools + 63) / 64; // ceiling division by 64
 
-
         // Calculate offsets...
         let bitmap_offset = (METADATA_SIZE + DIRECTORY_ALIGNMENT - 1) & !(DIRECTORY_ALIGNMENT - 1);
         let directory_offset = bitmap_offset + (bitmap_words * 2 * size_of::<AtomicU64>());
-        let directory_offset = (directory_offset + DIRECTORY_ALIGNMENT - 1) & !(DIRECTORY_ALIGNMENT - 1);
+        let directory_offset =
+            (directory_offset + DIRECTORY_ALIGNMENT - 1) & !(DIRECTORY_ALIGNMENT - 1);
 
         let mut allocator = Self {
             base_address,
             metadata,
             bitmap: (base_address + bitmap_offset as u64) as *mut PoolBitmap,
             pool_directory: (base_address + directory_offset as u64) as *mut PoolDirectoryEntry,
-            log_pool_address: None
+            log_pool_address: None,
         };
 
         unsafe {
@@ -212,7 +223,7 @@ impl GlobalPersistentAllocator {
                 } else {
                     if (*metadata).log_pool_offset != 0 {
                         // Restore log pool pointer from metadata
-                        // System Could be crashed..
+                        // System Could be crashed
                         let log_pool_address = base_address + (*metadata).log_pool_offset;
                         info!("Found LogPool: with address: 0x{:x}", log_pool_address);
 
@@ -220,18 +231,15 @@ impl GlobalPersistentAllocator {
                         Pool::perform_rollback(log_pool_address).expect("Failed to perform rollback");
                         Pool::empty_log_pool(log_pool_address);
                         Pool::init_log_pool(log_pool_address);
-
                     } else {
                         panic!("Invalid metadata: log pool offset is 0");
                     }
-
 
                     info!("Recovery check successful: {:?}", status);
                     // Verify configuration
                     assert_eq!((*metadata).nvdimm_size, nvdimm_size, "NVDIMM size mismatch");
                     assert_eq!((*metadata).pool_size, FIXED_POOL_SIZE, "Pool size mismatch");
                 }
-
             }
         }
         //allocator.print_metadata_debug_info();
@@ -369,7 +377,7 @@ impl GlobalPersistentAllocator {
             let mut new_entry = PoolDirectoryEntry {
                 name: [0; 64],
                 //pool: Some(Pool::new(pool_address, FIXED_POOL_SIZE, self.log_pool_address)),
-                pool: Some(Pool::new(pool_address, FIXED_POOL_SIZE)),//test
+                pool: Some(Pool::new(pool_address, FIXED_POOL_SIZE)), //test
                 _padding: [0; 8],
             };
             ptr::copy_nonoverlapping(name.as_ptr(), new_entry.name.as_mut_ptr(), name.len());
@@ -408,10 +416,7 @@ impl GlobalPersistentAllocator {
             // Final fence
             core::arch::x86_64::_mm_sfence();
 
-
-
             entry.pool.as_mut().ok_or(AllocError::InconsistentState)
-
         }
     }
 
@@ -443,7 +448,7 @@ impl GlobalPersistentAllocator {
                     ptr::copy_nonoverlapping(
                         LOG_POOL_NAME.as_ptr(),
                         new_entry.name.as_mut_ptr(),
-                        LOG_POOL_NAME.len()
+                        LOG_POOL_NAME.len(),
                     );
 
                     // Update bitmap and entry
@@ -466,7 +471,6 @@ impl GlobalPersistentAllocator {
             Err(AllocError::NoPoolsAvailable)
         }
     }
-
 
     pub fn release_pool(&mut self, name: &[u8]) -> bool {
         if name.len() >= 64 || name.len() <= 0 {
@@ -533,12 +537,8 @@ impl GlobalPersistentAllocator {
                 + ((*self.metadata).total_pools.load(Ordering::Relaxed) as usize
                 * mem::size_of::<PoolDirectoryEntry>()) as u64
         };
-
-        //info!("  Final offset: 0x{:x}", offset);
         offset
     }
-
-
 
     fn compare_name(&self, name: &[u8], entry_name: &[u8; 64]) -> bool {
         let mut i = 0;
@@ -607,7 +607,7 @@ impl GlobalPersistentAllocator {
             if (*self.metadata).total_pools.load(Ordering::Relaxed) == 0 {
                 return false;
             }
-            
+
             true
         }
     }
@@ -623,9 +623,7 @@ impl GlobalPersistentAllocator {
             }
         }
 
-        unsafe {
-            count == (*self.metadata).used_pools.load(Ordering::Relaxed)
-        }
+        unsafe { count == (*self.metadata).used_pools.load(Ordering::Relaxed) }
     }
 
     fn print_metadata_debug_info(&self) {
@@ -633,23 +631,42 @@ impl GlobalPersistentAllocator {
             info!("=== NVDIMM Metadata Debug Info ===");
             info!("Base address: 0x{:x}", self.base_address);
             info!("Magic number: 0x{:x}", (*self.metadata).magic_number);
-            info!("NVDIMM size: {} bytes ({} MB)",
+            info!(
+                "NVDIMM size: {} bytes ({} MB)",
                 (*self.metadata).nvdimm_size,
-                (*self.metadata).nvdimm_size / (1024 * 1024));
-            info!("Pool size: {} bytes ({} KB)",
+                (*self.metadata).nvdimm_size / (1024 * 1024)
+            );
+            info!(
+                "Pool size: {} bytes ({} KB)",
                 (*self.metadata).pool_size,
-                (*self.metadata).pool_size / 1024);
+                (*self.metadata).pool_size / 1024
+            );
 
             // Pool information
-            info!("Total pools: {}", (*self.metadata).total_pools.load(Ordering::Acquire));
-            info!("Used pools: {}", (*self.metadata).used_pools.load(Ordering::Acquire));
-            info!("Initialized pools: {}", (*self.metadata).initialized_pools.load(Ordering::Acquire));
+            info!(
+                "Total pools: {}",
+                (*self.metadata).total_pools.load(Ordering::Acquire)
+            );
+            info!(
+                "Used pools: {}",
+                (*self.metadata).used_pools.load(Ordering::Acquire)
+            );
+            info!(
+                "Initialized pools: {}",
+                (*self.metadata).initialized_pools.load(Ordering::Acquire)
+            );
 
             // Layout information
             info!("Bitmap offset: 0x{:x}", (*self.metadata).bitmap_offset);
-            info!("Pool directory offset: 0x{:x}", (*self.metadata).pool_directory_offset);
-            info!("Pool directory size: {} bytes",
-                (*self.metadata).total_pools.load(Ordering::Acquire) as usize * size_of::<PoolDirectoryEntry>());
+            info!(
+                "Pool directory offset: 0x{:x}",
+                (*self.metadata).pool_directory_offset
+            );
+            info!(
+                "Pool directory size: {} bytes",
+                (*self.metadata).total_pools.load(Ordering::Acquire) as usize
+                    * size_of::<PoolDirectoryEntry>()
+            );
             info!("Bitmap words: {}", (*self.metadata).bitmap_words);
 
             info!("=== Log Pool Information ===");
@@ -661,12 +678,20 @@ impl GlobalPersistentAllocator {
 
             // Statistics
             info!("=== Statistics ===");
-            info!("Initialization failures: {}",
-                (*self.metadata).initialization_failures.load(Ordering::Acquire));
-            info!("Total allocations: {}",
-                (*self.metadata).total_allocations.load(Ordering::Acquire));
-            info!("Total deallocations: {}",
-                (*self.metadata).total_deallocations.load(Ordering::Acquire));
+            info!(
+                "Initialization failures: {}",
+                (*self.metadata)
+                    .initialization_failures
+                    .load(Ordering::Acquire)
+            );
+            info!(
+                "Total allocations: {}",
+                (*self.metadata).total_allocations.load(Ordering::Acquire)
+            );
+            info!(
+                "Total deallocations: {}",
+                (*self.metadata).total_deallocations.load(Ordering::Acquire)
+            );
             info!("==============================");
         }
     }

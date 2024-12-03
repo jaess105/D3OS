@@ -130,6 +130,7 @@ impl Pool {
 
             } else {
                 info!("Reusing existing pool at 0x{:x}", base);
+                //TODO: EVTL Noch sanity check?
             }
 
             pool.heap.lock().init(
@@ -170,7 +171,7 @@ impl Pool {
          }
 
         // Always check for recovery at start of transaction
-        //TODO: Brauche ich recover noch ? -> das hier ist bei neustart des Systems
+        //DOC: Hier wird  der Tatsächliche Speicher gelöscht
         self.recover()?;
 
         let mut ctx = TransactionContext {
@@ -214,20 +215,17 @@ impl Pool {
 
             for i in 0..(*self.header).max_objects {
                 let entry = &mut *table_base.add(i);
-                // If we find an entry that's active but not valid,
-                // it means we crashed during transaction commit
-                //TODO: Hier kann ich einfach setzen, denn das letze was passiert ist war das active gesetzt wurde
-                // Idee zustand gucken und ob vollständig
-                // Cases durchgehen:
-                // 1. Active und Valid und opertion_done -> alles gut
-                // 2. Active und Valid und nicht operation_done -> Eig nicht möglich
-                // 3. Active und nicht Valid und operation_done -> Entweder Alloc oder modify
+                //DOC: Hier kann ich einfach setzen, denn das letze was passiert ist war das active gesetzt wurde
+                // Aktueller Stand:
+                // !Active | !Valid |  OperationDone -> Normaler Dealloc
+                // !Active |  Valid |  OperationDone -> Testen ob unnötig
+                //  Active | !Valid |  OperationDone -> "Fastforward" Hier ist die Forschleife aus pendingchanges nicht fertig druchgelaufen!
+                // !Active | !Valid | !OperationDone -> Rollback von Allocate
+                //  Active |  Valid |  OperationDone -> Alles super -> nothing happens
 
-                // IDEE: Erst alle suchen und schauen ob es einen eintrag gibt der nicht operation_done ist
-                // FALLS das der Fall -> versuchen alles zu rollbacken
-                // FALLS das nicht der Fall -> alles valid setzen -> unwahrscheinlichj
                 if !entry.active.load(Ordering::Acquire) && entry.valid.load(Ordering::Acquire) && entry.operation_done.load(Ordering::Acquire) {
-                    //info!("Regular Deallocation");
+                    info!("Regular Deallocation");
+                    //TODO: EVLT IST DIESE FN useless??
 
                     Self::deallocate(self, entry.data.unwrap(), Layout::from_size_align(entry.type_size, 64).unwrap());
                     entry.active.store(false, Ordering::Release);
@@ -251,7 +249,7 @@ impl Pool {
                 }
 
                 if !entry.active.load(Ordering::Acquire) && !entry.valid.load(Ordering::Acquire) && entry.operation_done.load(Ordering::Acquire) {
-                    info!(">> LOG HAS FAILED << !DANGEROUS STATE!");
+                    //info!(">> LOG HAS FAILED << !DANGEROUS STATE!");
 
                     Self::deallocate(self, entry.data.unwrap(), Layout::from_size_align(entry.type_size, 64).unwrap());
                     entry.active.store(false, Ordering::Release);
@@ -313,7 +311,6 @@ impl Pool {
         }
     }
 
-    // pub(crate) fn perform_rollback(log_pool: &mut Pool) -> Result<(), PoolError> {
     pub(crate) fn perform_rollback(pool_base: u64) -> Result<(), PoolError> {
         unsafe {
 
@@ -322,9 +319,6 @@ impl Pool {
 
             let table_base = (pool_base + (*header).object_table_offset)
                 as *mut ObjectTableEntry;
-
-            // let table_base = (log_pool.base_address + log_pool.object_table_offset)
-            //     as *const ObjectTableEntry;
 
             // Process logs in reverse order
             for i in (0..MAX_OBJECT_ENTRIES).rev() {
@@ -625,8 +619,6 @@ impl Pool {
     pub fn empty_log_pool(pool_base: u64) {
         info!("Emptying log pool at 0x{:x}", pool_base);
         unsafe {
-            // let table_base = (self.base_address + (*self.header).object_table_offset)
-            //     as *mut ObjectTableEntry;
 
             let header = pool_base as *const PoolHeader;
             let table_base = (pool_base + (*header).object_table_offset)
@@ -635,22 +627,6 @@ impl Pool {
             for i in 0..MAX_OBJECT_ENTRIES {
                 if (*table_base.add(i)).active.load(Ordering::Acquire) {
                     let entry = &mut *table_base.add(i);
-                    // if let Some(ptr) = (*table_base.add(i)).data {
-                    //     // For log pool, include LoggedOperation size
-                    //     //let total_size = mem::size_of::<LoggedOperation>() + (*table_base.add(i)).type_size;
-                    //     info!("Before deallocation - Memory at 0x{:x}:", ptr.as_ptr() as u64);
-                    //     info!("with size: {}", (*table_base.add(i)).type_size);
-                    //
-                    //     self.heap.lock().deallocate(
-                    //         ptr,
-                    //         Layout::from_size_align((*table_base.add(i)).type_size, 8)
-                    //             .map_err(|_| PoolError::AllocationFailed)
-                    //             .unwrap()
-                    //     );
-                    //
-                    // }
-                    //qemu_exit(123);
-                    // Clear all entry data
                     entry.data = None;
                     entry.type_hash = 0;
                     entry.type_size = 0;
@@ -682,12 +658,6 @@ impl Pool {
                 heap_size
             );
 
-            //init the new heap
-            // self.heap = LockedHeap::empty();
-            // self.heap.lock().init(
-            //     (self.base_address + heap_offset) as *mut u8,
-            //     heap_size
-            // );
             Self::init_log_pool(pool_base);
 
         }
@@ -1017,6 +987,7 @@ impl<'a> TransactionContext<'a> {
                     //
                     // //DOC: END
 
+                        //DOC: habe ich hier rausgenommen -> passiert erst in recovery methode
                         //Real deallocation
                         // self.pool.heap.lock().deallocate(
                         //     ptr,
