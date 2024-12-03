@@ -259,12 +259,19 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             let mut allocator = persistent_allocator().write();
 
 
-            run_all_tests(&mut allocator);
-            //test_full_usage_allocator(&mut allocator);
+            //run_all_tests(&mut allocator);
+            test_basic_data_types(&mut allocator);
             //test_crash_recovery(&mut allocator);
             //test_linked_list(&mut allocator);
+            //test_full_usage_allocator(&mut allocator);
+
 
             //
+            //let pool = allocator.get_or_create_pool(b"RECOVERY_TEST").unwrap();
+            //let pool = allocator.get_or_create_pool(b"POOL1").unwrap();
+
+
+            //allocator.release_pool(b"RECOVERY_TEST");
             //let pool = allocator.get_or_create_pool(b"RECOVERY_TEST").unwrap();
             //
             // //pool.debug_print_object_table();
@@ -283,6 +290,8 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             //     Ok(_) => info!("Transaction successful"),
             //     Err(e) => info!("Transaction failed Correctly: {:?}", e),
             // }
+
+            //let pool1 = allocator.get_or_create_pool(b"RECOVERY_TEST").unwrap();
 
             //
             // match pool.transaction(|tx| {
@@ -610,6 +619,136 @@ fn test_multiple_pools(allocator: &mut GlobalPersistentAllocator) {
 
 }
 
+fn test_basic_data_types(allocator: &mut GlobalPersistentAllocator) {
+    info!("=== Testing Basic Data Types Storage ===");
+    let pool = allocator.get_or_create_pool(b"BASIC_TYPES").unwrap();
+
+    // Test string storage
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct PersistentString {
+        length: usize,
+        data: [u8; 64],  // Fixed size buffer
+    }
+
+    pool.transaction(|tx| {
+        // Store string
+        let test_str = "Hello, Persistent Memory!";
+        let mut pers_str = PersistentString {
+            length: test_str.len(),
+            data: [0; 64],
+        };
+        pers_str.data[..test_str.len()].copy_from_slice(test_str.as_bytes());
+
+        tx.allocate_with_id("test_string", pers_str)?;
+        info!("Stored string successfully");
+        Ok(())
+    }).expect("Failed to store string");
+
+    // Read string back
+    pool.transaction(|tx| {
+        let pers_str = tx.read_by_id::<PersistentString>("test_string")?;
+        let recovered_str = core::str::from_utf8(&pers_str.data[..pers_str.length])
+            .expect("Invalid UTF-8");
+        info!("Recovered string: {}", recovered_str);
+        Ok(())
+    }).expect("Failed to read string");
+
+    // Test different numeric types
+    pool.transaction(|tx| {
+        // Integers
+        tx.allocate_with_id("int8", -42i8)?;
+        tx.allocate_with_id("uint8", 42u8)?;
+        tx.allocate_with_id("int16", -1234i16)?;
+        tx.allocate_with_id("uint16", 1234u16)?;
+        tx.allocate_with_id("int32", -123456i32)?;
+        tx.allocate_with_id("uint32", 123456u32)?;
+        tx.allocate_with_id("int64", -123456789i64)?;
+        tx.allocate_with_id("uint64", 123456789u64)?;
+
+        // Boolean
+        tx.allocate_with_id("bool_true", true)?;
+        tx.allocate_with_id("bool_false", false)?;
+
+        // Character
+        tx.allocate_with_id("char", 'R')?;
+
+        info!("Stored all numeric types successfully");
+        Ok(())
+    }).expect("Failed to store numeric types");
+
+    // Read and verify all types
+    pool.transaction(|tx| {
+        // Read integers
+        info!("int8: {}", tx.read_by_id::<i8>("int8")?);
+        info!("uint8: {}", tx.read_by_id::<u8>("uint8")?);
+        info!("int16: {}", tx.read_by_id::<i16>("int16")?);
+        info!("uint16: {}", tx.read_by_id::<u16>("uint16")?);
+        info!("int32: {}", tx.read_by_id::<i32>("int32")?);
+        info!("uint32: {}", tx.read_by_id::<u32>("uint32")?);
+        info!("int64: {}", tx.read_by_id::<i64>("int64")?);
+        info!("uint64: {}", tx.read_by_id::<u64>("uint64")?);
+
+        // Read boolean
+        info!("bool_true: {}", tx.read_by_id::<bool>("bool_true")?);
+        info!("bool_false: {}", tx.read_by_id::<bool>("bool_false")?);
+
+        // Read character
+        info!("char: {}", tx.read_by_id::<char>("char")?);
+
+        Ok(())
+    }).expect("Failed to read numeric types");
+
+    // Test array storage
+    pool.transaction(|tx| {
+        // Store array
+        let array = [1, 2, 3, 4, 5];
+        tx.allocate_with_id("array", array)?;
+
+        // Store fixed-size matrix
+        let matrix = [[1, 2, 3], [4, 5, 6], [7, 8, 9]];
+        tx.allocate_with_id("matrix", matrix)?;
+
+        info!("Stored arrays successfully");
+        Ok(())
+    }).expect("Failed to store arrays");
+
+    // Read arrays back
+    pool.transaction(|tx| {
+        let array = tx.read_by_id::<[i32; 5]>("array")?;
+        info!("Recovered array: {:?}", array);
+
+        let matrix = tx.read_by_id::<[[i32; 3]; 3]>("matrix")?;
+        info!("Recovered matrix: {:?}", matrix);
+        Ok(())
+    }).expect("Failed to read arrays");
+
+    // // Test crash recovery with string
+    // pool.transaction(|tx| {
+    //     let test_str = "This string should survive a crash!";
+    //     let mut pers_str = PersistentString {
+    //         length: test_str.len(),
+    //         data: [0; 64],
+    //     };
+    //     pers_str.data[..test_str.len()].copy_from_slice(test_str.as_bytes());
+    //
+    //     tx.allocate_with_id("crash_string", pers_str)?;
+    //     info!("Stored string before crash");
+    //
+    //     Err::<(), PoolError>(PoolError::TransactionFailed)
+    // }).expect("Transaction should fail");
+    //
+    // // After restart, verify string
+    // pool.transaction(|tx| {
+    //     if let Ok(pers_str) = tx.read_by_id::<PersistentString>("crash_string") {
+    //         let recovered_str = core::str::from_utf8(&pers_str.data[..pers_str.length])
+    //             .expect("Invalid UTF-8");
+    //         info!("Recovered string after crash: {}", recovered_str);
+    //     }
+    //     Ok(())
+    // }).expect("Failed to verify after crash");
+}
+
 fn test_memory_pressure(allocator: &mut GlobalPersistentAllocator) {
     info!("=== Testing Memory Pressure ===");
     let pool = allocator.get_or_create_pool(b"PRESSURE_TEST").unwrap();
@@ -701,6 +840,7 @@ fn run_all_tests(allocator: &mut GlobalPersistentAllocator) {
     test_multiple_pools(allocator);
     test_memory_pressure(allocator);
     test_type_safety(allocator);
+    test_edge_cases(allocator);
     measure_performance_time(allocator);
 
     info!("All tests and measurement completed successfully!");

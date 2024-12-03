@@ -172,10 +172,7 @@ impl GlobalPersistentAllocator {
             panic!("Pool size too small, must be at least 8KB");
         }
 
-        info!(
-            "Trying to create a GlobalPersistentAllocator at address: 0x{:x}",
-            base_address
-        );
+        //nfo!("Trying to create a GlobalPersistentAllocator at address: 0x{:x}",base_address);
         let metadata = base_address as *mut GlobalMetadata;
 
         //let max_pools = calculate_max_pools_precise(nvdimm_size).unwrap();
@@ -199,7 +196,7 @@ impl GlobalPersistentAllocator {
 
         unsafe {
             if (*metadata).magic_number != ALLOCATOR_MAGIC {
-                info!("Initializing new NVDIMM metadata");
+                //info!("Initializing new NVDIMM metadata");
                 allocator.initialize(nvdimm_size, max_pools, bitmap_offset, directory_offset, bitmap_words);
                 // match allocator.create_log_pool() {
                 //     Ok(_) => info!("LOG pool initialized"),
@@ -209,7 +206,7 @@ impl GlobalPersistentAllocator {
                     panic!("Failed to create LOG pool: {:?}", e);
                 }
             } else {
-                info!("Found existing NVDIMM metadata, checking status");
+                //info!("Found existing NVDIMM metadata, checking status");
                 let status = allocator.check_recovery_status();
 
                 if !status.metadata_valid || !status.bitmap_consistent {
@@ -343,7 +340,7 @@ impl GlobalPersistentAllocator {
                     // Check if this is our pool
                     if self.compare_name(name, &entry.name) {
                         if let Some(pool) = &mut entry.pool {
-                            info!("Pool already exists");
+                            //info!("Pool already exists");
                             return Ok(pool);
                         }
                     }
@@ -354,13 +351,12 @@ impl GlobalPersistentAllocator {
 
             //Could be that the bitmap insnt full but no more store!
             if used_pools >= total_pools {
-                info!("Cannot create new pool: all {} pools are in use", total_pools);
+                //info!("Cannot create new pool: all {} pools are in use", total_pools);
                 return Err(AllocError::NoPoolsAvailable);
             }
 
             if first_free_slot.is_none() {
-                info!("Inconsistency detected: used_pools reported {} free slots but none found",
-                  total_pools - used_pools);
+                //info!("Inconsistency detected: used_pools reported {} free slots but none found", total_pools - used_pools);
                 (*self.metadata).initialization_failures.fetch_add(1, Ordering::Release);
                 return Err(AllocError::InconsistentState);
             }
@@ -382,7 +378,7 @@ impl GlobalPersistentAllocator {
             };
             ptr::copy_nonoverlapping(name.as_ptr(), new_entry.name.as_mut_ptr(), name.len());
             new_entry.name[name.len()] = 0;
-            info!("Created new Pool with ID {}", core::str::from_utf8(name).unwrap());
+            //info!("Created new Pool with ID {}", core::str::from_utf8(name).unwrap());
 
             // Batch update metadata counters
             let metadata = &*self.metadata;
@@ -422,7 +418,7 @@ impl GlobalPersistentAllocator {
 
     fn create_log_pool(&mut self) -> Result<(), AllocError> {
         unsafe {
-            info!("Creating log pool");
+            //info!("Creating log pool");
             let total_pools = (*self.metadata).total_pools.load(Ordering::Acquire);
 
             for i in 0..total_pools as usize {
@@ -433,7 +429,7 @@ impl GlobalPersistentAllocator {
                     let pool_address = self.base_address + pool_offset +
                         (i as u64 * FIXED_POOL_SIZE as u64);
 
-                    info!("Creating log pool at address: 0x{:x}", pool_address);
+                    //info!("Creating log pool at address: 0x{:x}", pool_address);
 
                     // Initialize the static log pool first
                     Pool::init_log_pool(pool_address);
@@ -487,15 +483,12 @@ impl GlobalPersistentAllocator {
                 if self.is_bit_set(i as usize, true) {
                     let entry = &mut *self.pool_directory.add(i as usize);
                     if self.compare_name(name, &entry.name) {
-                        info!(
-                            "Pool found! Releasing pool: {}",
-                            core::str::from_utf8(name).unwrap()
-                        );
+                        info!("Pool found! Releasing pool: {}",core::str::from_utf8(name).unwrap());
                         // Directly invalidate the pool's magic number
                         if let Some(pool) = &mut entry.pool {
                             // Use ptr::write_volatile to write to the header's magic field
                             ptr::write_volatile(&mut (*pool.header).magic as *mut u64, 0);
-                            pool.empty_pool();
+                            Pool::empty_pool(pool.base_address);
 
                             // Ensure write is flushed to persistence
                             core::arch::x86_64::_mm_sfence();
