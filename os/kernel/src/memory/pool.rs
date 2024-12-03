@@ -1,6 +1,7 @@
 use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::any::{type_name};
+use core::arch::x86_64::_rdtsc;
 use core::mem;
 use core::ptr;
 use core::ptr::NonNull;
@@ -741,10 +742,6 @@ impl Pool {
     }
 }
 
-
-
-
-
 //DOC: Wichtig für Thesis später
 // Track changes within a transaction
 // THIS IS ON THE DRAM !!!!!!!
@@ -808,28 +805,42 @@ impl<'a> TransactionContext<'a> {
             Pool::flush_cache_line(entry as *const _ as *const u8);
 
             //TODO: LAYOUT EVLT NOCH ANPASSEN
+            let start1 = unsafe { _rdtsc() };
             let ptr = self.pool.heap.lock()
                 .allocate_first_fit(Layout::new::<T>())
                 .map_err(|_| PoolError::AllocationFailed)?;
+            let end1 = unsafe { _rdtsc() };
+            let alloc = end1 - start1;
+            //info!("Allocation of LockedHeap took {} cycles", end - start);
 
 
             //DOC: Log the allocation BEFORE making it visible
             //info!("Starting to Allocate in Log");
+            let start2 = unsafe { _rdtsc() };
             self.pool.log_allocation(
                 ptr.as_ptr() as u64,
                 mem::size_of::<T>(),
                 Pool::compute_type_hash::<T>()
             )?;
+            let end2 = unsafe { _rdtsc() };
+            let log_alloc = end2 - start2;
             //info!("Offset: 0x{:x}", (ptr.as_ptr() as u64) - self.pool.base_address);
             //DOC: END
 
             //info!("Allocation in Log done");
 
-
+            let start3 = unsafe { _rdtsc() };
             entry.data = Some(ptr);
             ptr::write(ptr.as_ptr() as *mut T, data);
-            Pool::flush_cache_line(ptr.as_ptr() as *const u8);
+            let end3 = unsafe { _rdtsc() };
+            let write = end3 - start3;
 
+            let start4 = unsafe { _rdtsc() };
+            Pool::flush_cache_line(ptr.as_ptr() as *const u8);
+            let end4 = unsafe { _rdtsc() };
+            let flush = end4 - start4;
+
+            info!("Allocation: {} cycles, Log: {} cycles, Write: {} cycles, Flush: {} cycles", alloc, log_alloc, write, flush);
 
 
             // Mark as operation but not yet valid (valid happens at transaction commit)

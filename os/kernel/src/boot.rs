@@ -260,7 +260,8 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
 
 
             //run_all_tests(&mut allocator);
-            test_basic_data_types(&mut allocator);
+            //test_basic_data_types(&mut allocator);
+            measure_performance_time(&mut allocator);
             //test_crash_recovery(&mut allocator);
             //test_linked_list(&mut allocator);
             //test_full_usage_allocator(&mut allocator);
@@ -723,30 +724,30 @@ fn test_basic_data_types(allocator: &mut GlobalPersistentAllocator) {
         Ok(())
     }).expect("Failed to read arrays");
 
-    // // Test crash recovery with string
-    // pool.transaction(|tx| {
-    //     let test_str = "This string should survive a crash!";
-    //     let mut pers_str = PersistentString {
-    //         length: test_str.len(),
-    //         data: [0; 64],
-    //     };
-    //     pers_str.data[..test_str.len()].copy_from_slice(test_str.as_bytes());
-    //
-    //     tx.allocate_with_id("crash_string", pers_str)?;
-    //     info!("Stored string before crash");
-    //
-    //     Err::<(), PoolError>(PoolError::TransactionFailed)
-    // }).expect("Transaction should fail");
-    //
-    // // After restart, verify string
-    // pool.transaction(|tx| {
-    //     if let Ok(pers_str) = tx.read_by_id::<PersistentString>("crash_string") {
-    //         let recovered_str = core::str::from_utf8(&pers_str.data[..pers_str.length])
-    //             .expect("Invalid UTF-8");
-    //         info!("Recovered string after crash: {}", recovered_str);
-    //     }
-    //     Ok(())
-    // }).expect("Failed to verify after crash");
+    // Test crash recovery with string
+    pool.transaction(|tx| {
+        let test_str = "This string should survive a crash!";
+        let mut pers_str = PersistentString {
+            length: test_str.len(),
+            data: [0; 64],
+        };
+        pers_str.data[..test_str.len()].copy_from_slice(test_str.as_bytes());
+
+        tx.allocate_with_id("crash_string", pers_str)?;
+        info!("Stored string before crash");
+
+        Err::<(), PoolError>(PoolError::TransactionFailed)
+    }).expect_err("Transaction should fail");
+
+    // After restart, verify string
+    pool.transaction(|tx| {
+        if let Ok(pers_str) = tx.read_by_id::<PersistentString>("crash_string") {
+            let recovered_str = core::str::from_utf8(&pers_str.data[..pers_str.length])
+                .expect("Invalid UTF-8");
+            info!("Recovered string after crash: {}", recovered_str);
+        }
+        Ok(())
+    }).expect("Failed to verify after crash");
 }
 
 fn test_memory_pressure(allocator: &mut GlobalPersistentAllocator) {
