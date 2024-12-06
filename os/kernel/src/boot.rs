@@ -246,6 +246,10 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             let nvram_base = range.as_phys_frame_range().start.start_address().as_u64();
             let nvram_size = (range.as_phys_frame_range().end - range.as_phys_frame_range().start)
                 as usize * PAGE_SIZE;
+
+
+            //clear_nvram(nvram_base, nvram_size);
+
             let timer_start = timer.systime_ms();
             let start = unsafe { _rdtsc()};
             let allocator = GlobalPersistentAllocator::new(nvram_base, nvram_size);
@@ -1193,4 +1197,27 @@ fn tsc_to_ns(tsc_ticks: u64) -> u64 {
     const CPU_FREQUENCY_HZ: u64 = 2_400_000_000;
 
     (tsc_ticks * 1_000_000_000) / CPU_FREQUENCY_HZ
+}
+
+fn clear_nvram(base_address: u64, size: usize) {
+    unsafe {
+        info!("Clearing NVRAM from 0x{:x} to 0x{:x}", base_address, base_address + size as u64);
+
+        // Zero out all memory
+        ptr::write_bytes(
+            base_address as *mut u8,
+            0,
+            size
+        );
+
+        // Ensure everything is flushed to NVRAM
+        for offset in (0..size).step_by(64) {  // Step by cache line size
+            core::arch::x86_64::_mm_clflush((base_address as *const u8).add(offset));
+        }
+
+        // Final fence to ensure all flushes are complete
+        core::arch::x86_64::_mm_sfence();
+
+        info!("NVRAM cleared successfully");
+    }
 }

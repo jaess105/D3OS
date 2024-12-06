@@ -804,7 +804,6 @@ impl<'a> TransactionContext<'a> {
 
             Pool::flush_cache_line(entry as *const _ as *const u8);
 
-            //TODO: LAYOUT EVLT NOCH ANPASSEN
             let start1 = unsafe { _rdtsc() };
             let ptr = self.pool.heap.lock()
                 .allocate_first_fit(Layout::new::<T>())

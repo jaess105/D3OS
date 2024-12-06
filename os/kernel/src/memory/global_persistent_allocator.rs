@@ -10,7 +10,7 @@ const ALLOCATOR_MAGIC: u64 = 0x4433_4F53_4E56_4D4D; // "D3OS_NVMM"
 
 /// Fixed pool size for each pool
 /// DO NOT SET THIS SMALLER THAN 8Kb ! Space for metadata needed
-pub const FIXED_POOL_SIZE: usize = (1024 * 1024) * 2; // 1MB
+pub const FIXED_POOL_SIZE: usize = (1024 * 1024) * 4; // 1MB
 
 const BITS_PER_WORD: usize = 64;
 const METADATA_SIZE: usize = core::mem::size_of::<GlobalMetadata>();
@@ -239,7 +239,7 @@ impl GlobalPersistentAllocator {
                 }
             }
         }
-        //allocator.print_metadata_debug_info();
+        allocator.print_metadata_debug_info();
         allocator
     }
 
