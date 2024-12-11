@@ -55,7 +55,6 @@ pub(crate) struct GlobalPersistentAllocator {
     metadata: *mut GlobalMetadata,
     bitmap: *mut PoolBitmap,
     pool_directory: *mut PoolDirectoryEntry,
-    log_pool_address: Option<u64>, // Direct pointer to the log pool instead of searching always
 }
 
 #[derive(Debug)]
@@ -191,7 +190,6 @@ impl GlobalPersistentAllocator {
             metadata,
             bitmap: (base_address + bitmap_offset as u64) as *mut PoolBitmap,
             pool_directory: (base_address + directory_offset as u64) as *mut PoolDirectoryEntry,
-            log_pool_address: None,
         };
 
         unsafe {
@@ -663,10 +661,8 @@ impl GlobalPersistentAllocator {
             info!("Bitmap words: {}", (*self.metadata).bitmap_words);
 
             info!("=== Log Pool Information ===");
-            if let Some(log_pool_address) = self.log_pool_address {
-                info!("Log pool address: 0x{:x}", log_pool_address);
-            } else {
-                info!("Log pool not initialized");
+            if let log = (*self.metadata).log_pool_offset {
+                info!("Log pool offset: 0x{:x}", log);
             }
 
             // Statistics
