@@ -265,10 +265,11 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
 
             //run_all_tests(&mut allocator);
             //test_basic_data_types(&mut allocator);
-            measure_performance_time(&mut allocator);
-            //test_crash_recovery(&mut allocator);
+            //measure_performance_time(&mut allocator);
+            test_crash_recovery(&mut allocator);
             //test_linked_list(&mut allocator);
             //test_full_usage_allocator(&mut allocator);
+            //test_pool_limits(&mut allocator);
 
 
             //
@@ -283,9 +284,9 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             //
             //
             // match pool.transaction(|tx| {
-            //     //let a = tx.get_by_id::<u64>("data")?;
-            //     //tx.modify(a, |n| *n += 1)?;
-            //     let mut a = tx.allocate_with_id("data", 48879u64)?;
+            //     let a = tx.get_by_id::<u64>("data")?;
+            //     tx.modify(a, |n| *n += 1)?;
+            //     //let mut a = tx.allocate_with_id("data", 48879u64)?;
             //     //tx.deallocate_by_id("data")?;
             //
             //
@@ -557,6 +558,34 @@ struct LargeObject {
     data: [u8; 1024 * 4], // 4KB
 }
 
+// Create a large object that's almost 1MB
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct HugeObject {
+    id: u64,
+    data: [u8; 1000*64], // less than 1MB ,object table always takes 0x10040 bytes-> so we have less than 2MB
+}
+
+
+// Main test runner
+fn run_all_tests(allocator: &mut GlobalPersistentAllocator) {
+    test_single_pool(allocator);
+    test_multiple_pools(allocator);
+    test_basic_data_types(allocator);
+    test_memory_pressure(allocator);
+    test_type_safety(allocator);
+    test_edge_cases(allocator);
+    test_linked_list(allocator);
+    test_list_modifications(allocator);
+    test_list_stress(allocator);
+    test_pool_limits(allocator);
+    measure_performance_time(allocator);
+
+
+    info!("All tests and measurement completed successfully!");
+}
+
+
 // Test Scenarios
 fn test_single_pool(allocator: &mut GlobalPersistentAllocator) {
     info!("=== Testing Single Pool Operations ===");
@@ -566,7 +595,6 @@ fn test_single_pool(allocator: &mut GlobalPersistentAllocator) {
     info!("Test 1: Basic Operations");
     pool.transaction(|tx| {
         tx.allocate_with_id("small1", SmallObject { id: 1, active: true })?;
-        info!("Small object allocated");
         tx.allocate_with_id("medium1", MediumObject {
             id: 1,
             name: *b"TestObject\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
@@ -576,19 +604,27 @@ fn test_single_pool(allocator: &mut GlobalPersistentAllocator) {
             id: 1,
             data: [0; 1024 * 4],
         })?;
-        info!("Large object allocated");
-
         tx.deallocate_by_id("small1")?;
-
-
-
         tx.allocate_with_id("small2", SmallObject { id: 2, active: false })?;
         tx.allocate_with_id("small1", SmallObject { id: 123, active: true })?;
         Ok(())
     }).expect("Basic operations test failed");
 
-    // Print results
-    //pool.debug_print_object_table();
+    //verify
+    pool.transaction(|tx| {
+        let small1 = tx.read_by_id::<SmallObject>("small1")?;
+        let small2 = tx.read_by_id::<SmallObject>("small2")?;
+        let medium1 = tx.read_by_id::<MediumObject>("medium1")?;
+        let large1 = tx.read_by_id::<LargeObject>("large1")?;
+
+        assert_eq!(small1.id, 123);
+        assert_eq!(small1.active, true);
+        assert_eq!(small2.id, 2);
+        assert_eq!(small2.active, false);
+        assert_eq!(medium1.id, 1);
+        assert_eq!(large1.id, 1);
+        Ok(())
+    }).expect("Basic operations verification failed");
 }
 
 fn test_multiple_pools(allocator: &mut GlobalPersistentAllocator) {
@@ -618,7 +654,7 @@ fn test_multiple_pools(allocator: &mut GlobalPersistentAllocator) {
     {
         allocator.release_pool(b"POOL1");
         let pool3 = allocator.get_or_create_pool(b"POOL3").unwrap();
-        //pool3.debug_print_object_table();
+        pool3.debug_print_object_table();
     }
 
 
@@ -682,7 +718,7 @@ fn test_basic_data_types(allocator: &mut GlobalPersistentAllocator) {
         Ok(())
     }).expect("Failed to store numeric types");
 
-    // Read and verify all types
+    // Read and verify all types -> TODO: real matches
     pool.transaction(|tx| {
         // Read integers
         info!("int8: {}", tx.read_by_id::<i8>("int8")?);
@@ -743,12 +779,13 @@ fn test_basic_data_types(allocator: &mut GlobalPersistentAllocator) {
         Err::<(), PoolError>(PoolError::TransactionFailed)
     }).expect_err("Transaction should fail");
 
-    // After restart, verify string
+    //should not exist
     pool.transaction(|tx| {
         if let Ok(pers_str) = tx.read_by_id::<PersistentString>("crash_string") {
-            let recovered_str = core::str::from_utf8(&pers_str.data[..pers_str.length])
-                .expect("Invalid UTF-8");
-            info!("Recovered string after crash: {}", recovered_str);
+            // let recovered_str = core::str::from_utf8(&pers_str.data[..pers_str.length])
+            //     .expect("Invalid UTF-8");
+            // info!("Recovered string after crash: {}", recovered_str);
+            panic!("String should not exist after crash");
         }
         Ok(())
     }).expect("Failed to verify after crash");
@@ -837,18 +874,7 @@ fn measure_performance_time(allocator: &mut GlobalPersistentAllocator) {
         Ok(())
     }).expect("Large allocation failed");
 
-}
-
-// Main test runner
-fn run_all_tests(allocator: &mut GlobalPersistentAllocator) {
-    test_single_pool(allocator);
-    test_multiple_pools(allocator);
-    test_memory_pressure(allocator);
-    test_type_safety(allocator);
-    test_edge_cases(allocator);
-    measure_performance_time(allocator);
-
-    info!("All tests and measurement completed successfully!");
+    pool.debug_log_pool_state();
 }
 
 //FOR ME ONLY
@@ -873,6 +899,186 @@ fn test_full_usage_allocator(allocator: &mut GlobalPersistentAllocator) {
         }
     }
 }
+
+/// IMPORTANT: **Call this fn only if pools have exactly 4MB of storage**
+/// Description: Test pool Storage Limits
+///
+///
+///
+fn test_pool_limits(allocator: &mut GlobalPersistentAllocator) {
+    info!("=== Testing Pool Storage Limits ===");
+
+    //Test 1: Maximum number of small objects (1024)
+    info!("Test 1: Maximum number of objects (1024 small objects)");
+    {
+        let pool = allocator.get_or_create_pool(b"MAX_OBJECTS").unwrap();
+
+        // Try to allocate 1024 small objects (should succeed)
+        pool.transaction(|tx| {
+            for i in 0..1024 {
+                tx.allocate_with_id(
+                    &format!("small_{}", i),
+                    SmallObject { id: i as u32, active: true }
+                )?;
+            }
+            info!("Successfully allocated 1024 objects");
+            Ok(())
+        }).expect("Failed to allocate 1024 objects");
+
+        // Try to allocate one more object (should fail)
+        match pool.transaction(|tx| {
+            tx.allocate_with_id(
+                "one_too_many",
+                SmallObject { id: 1025, active: true }
+            )?;
+            Ok(())
+        }) {
+            Err(PoolError::ObjectTableFull) => info!("Successfully caught object limit overflow"),
+            Ok(_) => panic!("Expected failure on 1025th object, but it succeeded"),
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        }
+    }
+
+    info!("Test 2: Maximum size limit (4,128,704 bytes)");
+    {
+        let pool = allocator.get_or_create_pool(b"MAX_SIZE").unwrap();
+
+        info!("Pool created successfully");
+        //pool.debug_print_object_table();
+
+
+        info!("HugeObject size: {} bytes", core::mem::size_of::<HugeObject>());
+
+        // We need about 64 objects to reach ~4MB (64 * 64KB = 4MB)
+        // Let's allocate them in chunks to test different scenarios
+
+        // First chunk (16 objects = ~1MB)
+        match pool.transaction(|tx| {
+            info!("Allocating first chunk (16 objects, ~1MB)...");
+            for i in 0..16 {
+                tx.allocate_with_id(
+                    &format!("huge_{}", i),
+                    HugeObject { id: i as u64, data: [i as u8; 1000 * 64] }
+                )?;
+            }
+            info!("First chunk allocated successfully");
+            Ok(())
+        }) {
+            Ok(_) => info!("First 1MB allocation completed successfully"),
+            Err(e) => panic!("First chunk allocation failed: {:?}", e),
+        }
+
+        // Second chunk (16 objects = ~1MB)
+        match pool.transaction(|tx| {
+            info!("Allocating second chunk (16 objects, ~1MB)...");
+            for i in 16..32 {
+                tx.allocate_with_id(
+                    &format!("huge_{}", i),
+                    HugeObject { id: i as u64, data: [i as u8; 1000 * 64] }
+                )?;
+            }
+            info!("Second chunk allocated successfully");
+            Ok(())
+        }) {
+            Ok(_) => info!("Second 1MB allocation completed successfully"),
+            Err(e) => panic!("Second chunk allocation failed: {:?}", e),
+        }
+
+        // Third chunk (16 objects = ~1MB)
+        match pool.transaction(|tx| {
+            info!("Allocating third chunk (16 objects, ~1MB)...");
+            for i in 32..48 {
+                tx.allocate_with_id(
+                    &format!("huge_{}", i),
+                    HugeObject { id: i as u64, data: [i as u8; 1000 * 64] }
+                )?;
+            }
+            info!("Third chunk allocated successfully");
+            Ok(())
+        }) {
+            Ok(_) => info!("Third 1MB allocation completed successfully"),
+            Err(e) => panic!("Third chunk allocation failed: {:?}", e),
+        }
+
+        // Fourth chunk (16 objects = ~1MB)
+        match pool.transaction(|tx| {
+            info!("Allocating fourth chunk (16 objects, ~1MB)...");
+            for i in 48..64 {
+                tx.allocate_with_id(
+                    &format!("huge_{}", i),
+                    HugeObject { id: i as u64, data: [i as u8; 1000 * 64] }
+                )?;
+            }
+            info!("Fourth chunk allocated successfully");
+            Ok(())
+        }) {
+            Ok(_) => info!("Fourth 1MB allocation completed successfully"),
+            Err(e) => panic!("Fourth chunk allocation failed: {:?}", e),
+        }
+
+        //allocate the rest of the memory -> 4128704 - 4*16*64*1000 = 32704
+
+        #[repr(C)]
+        #[derive(Copy, Clone)]
+        struct SpecialObject {
+            id: u64,
+            data: [u8; 32127],
+        }
+
+        match pool.transaction(|tx| {
+            info!("Allocating rest of the memory...");
+
+                tx.allocate_with_id(
+                    &format!("huge_65"),
+                    SpecialObject { id: 10 as u64, data: [1 as u8; 32127] }
+                )?;
+
+            info!("Rest of the memory allocated successfully");
+            Ok(())
+        }) {
+            Ok(_) => info!("Rest of the memory allocation completed successfully"),
+            Err(e) => panic!("Rest of the memory allocation failed: {:?}", e),
+        }
+
+
+        // Verify all allocations
+        match pool.transaction(|tx| {
+            info!("Verifying all allocations...");
+            for i in 0..64 {
+                match tx.read_by_id::<HugeObject>(&format!("huge_{}", i)) {
+                    Ok(obj) => {
+                        assert_eq!(obj.id, i as u64, "Object ID mismatch for huge_{}", i);
+                        assert_eq!(obj.data[0], i as u8, "Data mismatch for huge_{}", i);
+                    },
+                    Err(e) => panic!("Failed to verify object huge_{}: {:?}", i, e),
+                }
+            }
+            info!("All allocations verified successfully");
+            Ok(())
+        }) {
+            Ok(_) => info!("Verification completed successfully"),
+            Err(e) => panic!("Verification failed: {:?}", e),
+        }
+
+        // Try to allocate one more object (should fail as we're at the limit)
+        match pool.transaction(|tx| {
+            info!("Attempting to allocate beyond limit...");
+            tx.allocate_with_id(
+                "huge_overflow",
+                HugeObject { id: 64, data: [64; 1000 * 64] }
+            )?;
+            Ok(())
+        }) {
+            Err(PoolError::AllocationFailed) => info!("Successfully caught size limit overflow"),
+            Ok(_) => panic!("Expected failure on overflow allocation, but it succeeded"),
+            Err(e) => panic!("Unexpected error on overflow allocation: {:?}", e),
+        }
+
+        //pool.debug_print_object_table();
+        info!("Test 2 completed successfully");
+    }
+}
+
 
 fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
     info!("=== Testing Crash Recovery ===");
@@ -1124,7 +1330,7 @@ fn test_list_modifications(allocator: &mut GlobalPersistentAllocator) {
     }).expect("Failed to verify recovery");
 }
 
-unsafe fn test_list_stress(allocator: &mut GlobalPersistentAllocator) {
+fn test_list_stress(allocator: &mut GlobalPersistentAllocator) {
     let pool = allocator.get_or_create_pool(b"LIST_STRESS").unwrap();
 
     // Add many nodes quickly
@@ -1142,7 +1348,9 @@ unsafe fn test_list_stress(allocator: &mut GlobalPersistentAllocator) {
 
     // Modify nodes randomly
     for _ in 0..50 {
-        let idx = (core::arch::x86_64::_rdtsc() % 100) as u64;
+
+        let idx = unsafe {_rdtsc() % 100};
+
         pool.transaction(|tx| {
             if let Ok(ptr) = tx.get_by_id::<ListNode>(&format!("stress_node_{}", idx)) {
                 tx.modify(ptr, |n| n.value += 1000)?;
@@ -1169,27 +1377,6 @@ fn test_edge_cases(allocator: &mut GlobalPersistentAllocator) {
         Ok(())
     }).expect("Allocation deallocation test failed");
 
-}
-
-//OLD
-fn analyze_memory_utilization(pool: &mut Pool) {
-    pool.transaction(|tx| {
-        // Allocate different sized objects
-        tx.allocate_with_id("small", SmallObject { id: 1, active: true })?;
-        tx.allocate_with_id("medium", MediumObject {
-            id: 1,
-            name: [0; 32],
-            data: [0; 256],
-        })?;
-        tx.allocate_with_id("large", LargeObject {
-            id: 1,
-            data: [0; 1024 * 4],
-        })?;
-        Ok(())
-    }).expect("Memory utilization test failed");
-
-    // Print detailed memory statistics
-    //pool.debug_print_object_table();
 }
 
 fn tsc_to_ns(tsc_ticks: u64) -> u64 {
