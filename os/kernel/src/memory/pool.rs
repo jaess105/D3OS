@@ -81,7 +81,6 @@ pub enum PoolError {
     },
     InvalidId,
     ObjectTableFull,
-    JournalFull,
     InconsistentState,
     LogPoolFull,
     LogPoolNotAvailable,
@@ -102,12 +101,12 @@ impl Pool {
         let header = base as *mut PoolHeader;
         let object_table_offset = align_up(mem::size_of::<PoolHeader>(), 64) as u64;
         let heap_offset = align_up(object_table_offset as usize + mem::size_of::<ObjectTableEntry>() * MAX_OBJECT_ENTRIES, 64) as u64;
-        let heap_size = size - heap_offset as usize - object_table_offset as usize;
+        //let heap_size = size - heap_offset as usize - object_table_offset as usize;
+        let heap_size = size - heap_offset as usize;
 
         let pool = Self {
             base_address: base,
             header,
-            //log_pool_address,
             object_table_offset,
             heap: LockedHeap::empty(),
         };
@@ -282,7 +281,19 @@ impl Pool {
 
                         //wert deaktivieren... kann nur neu gemacht werden über allocate!
                         //info!(">> Data has been Rollbacked");
-                        Self::deallocate(self, entry.data.unwrap(), Layout::from_size_align(entry.type_size, 64).unwrap());
+
+                        match entry.data {
+                            Some(data) => {
+                                // If data was allocated, deallocate it
+                                Self::deallocate(self, data, Layout::from_size_align(entry.type_size, 64).unwrap());
+                            },
+                            None => {
+                                // If no data was allocated, just continue with cleanup
+                                // No need to deallocate
+                            }
+                        }
+
+                        //Self::deallocate(self, entry.data.unwrap(), Layout::from_size_align(entry.type_size, 64).unwrap());
                         entry.active.store(false, Ordering::Release);
 
                         // Clear all entry data
@@ -492,7 +503,7 @@ impl Pool {
                     },
                     Err(e) => {
                         //info!("Allocation failed in pool at 0x{:x}: {:?}", self.base_address, e);
-                        return Err(PoolError::AllocationFailed);
+                        return Err(PoolError::LogPoolFull);
                     }
                 }
             }
@@ -697,9 +708,9 @@ impl Pool {
             info!("=== Object Table Debug Information ===");
             info!("Object Table Location: 0x{:x}", table_base as u64);
 
-            //TODO: WIEDER EINKOMMENTIEREN
-            // for i in 0..MAX_OBJECT_ENTRIES {
-            for i in 0..5 {
+
+            for i in 0..MAX_OBJECT_ENTRIES {
+            //for i in 0..10 {
                 let entry = &*table_base.add(i);
                 //if entry.active.load(Ordering::Acquire) {
                     let id_str = core::str::from_utf8_unchecked(&entry.id[..entry.id_len as usize]);
@@ -839,7 +850,7 @@ impl<'a> TransactionContext<'a> {
             let end4 = unsafe { _rdtsc() };
             let flush = end4 - start4;
 
-            info!("Allocation: {} cycles, Log: {} cycles, Write: {} cycles, Flush: {} cycles", alloc, log_alloc, write, flush);
+            //info!("Allocation: {} cycles, Log: {} cycles, Write: {} cycles, Flush: {} cycles", alloc, log_alloc, write, flush);
 
 
             // Mark as operation but not yet valid (valid happens at transaction commit)

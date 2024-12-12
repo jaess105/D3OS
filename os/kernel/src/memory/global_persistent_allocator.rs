@@ -9,7 +9,7 @@ use x86_64::instructions::port::Port;
 const ALLOCATOR_MAGIC: u64 = 0x4433_4F53_4E56_4D4D; // "D3OS_NVMM"
 
 /// Fixed pool size for each pool
-/// DO NOT SET THIS SMALLER THAN 8Kb ! Space for metadata needed
+/// DO NOT SET THIS SMALLER THAN 65Kb ! Space for metadata needed
 pub const FIXED_POOL_SIZE: usize = (1024 * 1024) * 4; // 1MB
 
 const BITS_PER_WORD: usize = 64;
@@ -167,8 +167,8 @@ impl GlobalPersistentAllocator {
     }
 
     pub fn new(base_address: u64, nvdimm_size: usize) -> Self {
-        if FIXED_POOL_SIZE < 8 * 1024 {
-            panic!("Pool size too small, must be at least 8KB");
+        if FIXED_POOL_SIZE < 65 * 1024 {
+            panic!("Pool size too small, must be at least 65KB");
         }
 
         //nfo!("Trying to create a GlobalPersistentAllocator at address: 0x{:x}",base_address);
@@ -225,7 +225,6 @@ impl GlobalPersistentAllocator {
 
                         Pool::perform_rollback(log_pool_address).expect("Failed to perform rollback");
                         Pool::empty_log_pool(log_pool_address);
-                        Pool::init_log_pool(log_pool_address);
                     } else {
                         panic!("Invalid metadata: log pool offset is 0");
                     }
