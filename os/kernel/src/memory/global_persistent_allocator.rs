@@ -10,7 +10,7 @@ const ALLOCATOR_MAGIC: u64 = 0x4433_4F53_4E56_4D4D; // "D3OS_NVMM"
 
 /// Fixed pool size for each pool
 /// DO NOT SET THIS SMALLER THAN 65Kb ! Space for metadata needed
-pub const FIXED_POOL_SIZE: usize = (1024 * 1024) * 4; // 1MB
+pub const FIXED_POOL_SIZE: usize = (1024 * 1024) * 4; // 4MB
 
 const BITS_PER_WORD: usize = 64;
 const METADATA_SIZE: usize = core::mem::size_of::<GlobalMetadata>();
@@ -171,7 +171,6 @@ impl GlobalPersistentAllocator {
             panic!("Pool size too small, must be at least 65KB");
         }
 
-        //nfo!("Trying to create a GlobalPersistentAllocator at address: 0x{:x}",base_address);
         let metadata = base_address as *mut GlobalMetadata;
 
         //let max_pools = calculate_max_pools_precise(nvdimm_size).unwrap();
@@ -194,17 +193,11 @@ impl GlobalPersistentAllocator {
 
         unsafe {
             if (*metadata).magic_number != ALLOCATOR_MAGIC {
-                //info!("Initializing new NVDIMM metadata");
                 allocator.initialize(nvdimm_size, max_pools, bitmap_offset, directory_offset, bitmap_words);
-                // match allocator.create_log_pool() {
-                //     Ok(_) => info!("LOG pool initialized"),
-                //     Err(e) => panic!("Failed to create LOG pool: {:?}", e),
-                // }
                 if let Err(e) = allocator.create_log_pool() {
                     panic!("Failed to create LOG pool: {:?}", e);
                 }
             } else {
-                //info!("Found existing NVDIMM metadata, checking status");
                 let status = allocator.check_recovery_status();
 
                 if !status.metadata_valid || !status.bitmap_consistent {
@@ -348,12 +341,12 @@ impl GlobalPersistentAllocator {
 
             //Could be that the bitmap insnt full but no more store!
             if used_pools >= total_pools {
-                //info!("Cannot create new pool: all {} pools are in use", total_pools);
+                info!("Cannot create new pool: all {} pools are in use", total_pools);
                 return Err(AllocError::NoPoolsAvailable);
             }
 
             if first_free_slot.is_none() {
-                //info!("Inconsistency detected: used_pools reported {} free slots but none found", total_pools - used_pools);
+                info!("Inconsistency detected: used_pools reported {} free slots but none found", total_pools - used_pools);
                 (*self.metadata).initialization_failures.fetch_add(1, Ordering::Release);
                 return Err(AllocError::InconsistentState);
             }
@@ -362,7 +355,6 @@ impl GlobalPersistentAllocator {
             let (index, entry) = first_free_slot.unwrap();
 
             // Create new pool if slot found
-
             let pool_offset = self.get_pool_data_offset();
             let pool_address = self.base_address + pool_offset + (index as u64 * FIXED_POOL_SIZE as u64);
 
@@ -374,16 +366,15 @@ impl GlobalPersistentAllocator {
                 _padding: [0; 8],
             };
             ptr::copy_nonoverlapping(name.as_ptr(), new_entry.name.as_mut_ptr(), name.len());
-            new_entry.name[name.len()] = 0;
-            //info!("Created new Pool with ID {}", core::str::from_utf8(name).unwrap());
+            new_entry.name[name.len()] = 0; //DOC: Null-terminate
 
-            // Batch update metadata counters
-            let metadata = &*self.metadata;
-            metadata.used_pools.fetch_add(1, Ordering::Release);
-            metadata.initialized_pools.fetch_add(1, Ordering::Release);
-            metadata.total_allocations.fetch_add(1, Ordering::Release);
+            // Write and persist entry
+            //DOC Reserve -> part of allocation
+            ptr::write_volatile(entry, new_entry);
+            core::arch::x86_64::_mm_clflush(entry as *const PoolDirectoryEntry as *const u8);
 
             // Set both bits in bitmap
+            // DOC: Activation -> now able to find!
             let word_index = index / BITS_PER_WORD;
             let bit_index = index % BITS_PER_WORD;
             let mask = 1u64 << bit_index;
@@ -395,16 +386,9 @@ impl GlobalPersistentAllocator {
             init_word.fetch_or(mask, Ordering::SeqCst);
             used_word.fetch_or(mask, Ordering::SeqCst);
 
-            // Single fence before flushes
-            core::arch::x86_64::_mm_sfence();
-
             // Flush bitmap updates
             core::arch::x86_64::_mm_clflush(init_word as *const AtomicU64 as *const u8);
             core::arch::x86_64::_mm_clflush(used_word as *const AtomicU64 as *const u8);
-
-            // Write and persist entry
-            ptr::write_volatile(entry, new_entry);
-            core::arch::x86_64::_mm_clflush(entry as *const PoolDirectoryEntry as *const u8);
 
             // Final fence
             core::arch::x86_64::_mm_sfence();
@@ -428,6 +412,7 @@ impl GlobalPersistentAllocator {
 
                     //info!("Creating log pool at address: 0x{:x}", pool_address);
 
+                    // DOC: RESERVE
                     // Initialize the static log pool first
                     Pool::init_log_pool(pool_address);
 
@@ -444,14 +429,15 @@ impl GlobalPersistentAllocator {
                         LOG_POOL_NAME.len(),
                     );
 
-                    // Update bitmap and entry
-                    self.set_bit(i, true, true);
-                    self.set_bit(i, false, true);
-
                     ptr::write_volatile(entry, new_entry);
                     core::arch::x86_64::_mm_sfence();
                     core::arch::x86_64::_mm_clflush(entry as *const PoolDirectoryEntry as *const u8);
                     core::arch::x86_64::_mm_sfence();
+
+                    // DOC ACTIVATE
+                    // Update bitmap and entry
+                    self.set_bit(i, true, true);
+                    self.set_bit(i, false, true);
 
                     // Update metadata
                     (*self.metadata).log_pool_offset = pool_address - self.base_address;
@@ -477,6 +463,7 @@ impl GlobalPersistentAllocator {
         unsafe {
             let total_pools = (*self.metadata).total_pools.load(Ordering::Acquire);
             for i in 0..total_pools {
+                //TODO: NOch überlegen ob es hier sinn macht, könnte sein, dass pool reserved aber nicht aktiviert wurde..
                 if self.is_bit_set(i as usize, true) {
                     let entry = &mut *self.pool_directory.add(i as usize);
                     if self.compare_name(name, &entry.name) {
@@ -485,12 +472,12 @@ impl GlobalPersistentAllocator {
                         if let Some(pool) = &mut entry.pool {
                             // Use ptr::write_volatile to write to the header's magic field
                             ptr::write_volatile(&mut (*pool.header).magic as *mut u64, 0);
-                            Pool::empty_pool(pool.base_address);
-
                             // Ensure write is flushed to persistence
                             core::arch::x86_64::_mm_sfence();
                             core::arch::x86_64::_mm_clflush(&(*pool.header).magic as *const u64 as *const u8);
                             core::arch::x86_64::_mm_sfence();
+
+                            Pool::empty_pool(pool.base_address);
                         }
 
                         // Clear bits
