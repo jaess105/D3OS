@@ -7,7 +7,7 @@
    ║ Author: Fabian Ruhland, HHU                                             ║
    ╚═════════════════════════════════════════════════════════════════════════╝
 */
-
+use alloc::boxed::Box;
 use crate::interrupt::interrupt_dispatcher;
 use crate::{naming, init_persistent_allocator, persistent_allocator};
 use crate::syscall::syscall_dispatcher;
@@ -265,15 +265,17 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
 
             //run_all_tests(&mut allocator);
             //test_basic_data_types(&mut allocator);
-            //measure_performance_time(&mut allocator);
-            test_crash_recovery(&mut allocator);
+            measure_performance_time(&mut allocator);
+            //test_crash_recovery(&mut allocator);
             //test_linked_list(&mut allocator);
             //test_full_usage_allocator(&mut allocator);
             //test_pool_limits(&mut allocator);
 
 
             //
+            //allocator.release_pool(b"RECOVERY_TEST");
             //let pool = allocator.get_or_create_pool(b"RECOVERY_TEST").unwrap();
+            //pool.debug_print_object_table();
             //let pool = allocator.get_or_create_pool(b"POOL1").unwrap();
 
 
@@ -284,11 +286,10 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             //
             //
             // match pool.transaction(|tx| {
-            //     let a = tx.get_by_id::<u64>("data")?;
-            //     tx.modify(a, |n| *n += 1)?;
-            //     //let mut a = tx.allocate_with_id("data", 48879u64)?;
+            //     //let a = tx.get_by_id::<u64>("data")?;
+            //     //tx.modify(a, |n| *n += 1)?;
+            //     let mut a = tx.allocate_with_id("data", 48879u64)?;
             //     //tx.deallocate_by_id("data")?;
-            //
             //
             //     //qemu_exit(123);
             //     Ok(())
@@ -296,6 +297,7 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             //     Ok(_) => info!("Transaction successful"),
             //     Err(e) => info!("Transaction failed Correctly: {:?}", e),
             // }
+
 
             //let pool1 = allocator.get_or_create_pool(b"RECOVERY_TEST").unwrap();
 
@@ -654,7 +656,7 @@ fn test_multiple_pools(allocator: &mut GlobalPersistentAllocator) {
     {
         allocator.release_pool(b"POOL1");
         let pool3 = allocator.get_or_create_pool(b"POOL3").unwrap();
-        pool3.debug_print_object_table();
+        //pool3.debug_print_object_table();
     }
 
 
@@ -861,6 +863,29 @@ fn measure_performance_time(allocator: &mut GlobalPersistentAllocator) {
         Ok(())
     }).expect("Bulk allocation failed");
 
+    pool.transaction(|tx| {
+        let start5 = unsafe { _rdtsc() };
+        for i in 0..200 {
+            tx.allocate_with_id(&format!("bulk{}", i), i as u64)?;
+        }
+        let end5 = unsafe { _rdtsc() };
+        info!("200 allocations: {} tsc (avg: {} tsc per allocation)",
+        end5-start5, (end5-start5) as f64 / 100.0
+    );
+        Ok(())
+    }).expect("Bulk allocation failed");
+
+    pool.transaction(|tx| {
+        let start6 = unsafe { _rdtsc() };
+        for i in 0..500 {
+            tx.allocate_with_id(&format!("bulk{}", i), i as u64)?;
+        }
+        let end6 = unsafe { _rdtsc() };
+        info!("500 allocations: {} tsc (avg: {} tsc per allocation)",
+        end6-start6, (end6-start6) as f64 / 100.0
+    );
+        Ok(())
+    }).expect("Bulk allocation failed");
 
     // Measure large allocation
     pool.transaction(|tx| {
@@ -874,7 +899,42 @@ fn measure_performance_time(allocator: &mut GlobalPersistentAllocator) {
         Ok(())
     }).expect("Large allocation failed");
 
-    pool.debug_log_pool_state();
+    //Compare with KernelAlloc
+    let start7 = unsafe { _rdtsc() };
+    let _ = Box::new(1u64);
+    let end7 = unsafe { _rdtsc() };
+    info!("KernelAlloc 8bytes: {} tsc", end7 - start7);
+
+    let start8 = unsafe { _rdtsc() };
+    for i in 0..100 {
+        let _ = Box::new(i as u64);
+    }
+    let end8 = unsafe { _rdtsc() };
+    info!("KernelAlloc 100 allocations: {} tsc (avg: {} tsc per allocation)",
+        end8 - start8, (end8 - start8) as f64 / 100.0);
+
+    let start9 = unsafe { _rdtsc() };
+    for i in 0..200 {
+        let _ = Box::new(i as u64);
+    }
+    let end9 = unsafe { _rdtsc() };
+    info!("KernelAlloc 200 allocations: {} tsc (avg: {} tsc per allocation)",
+        end8 - start8, (end8 - start8) as f64 / 100.0);
+
+    let start10 = unsafe { _rdtsc() };
+    for i in 0..500 {
+        let _ = Box::new(i as u64);
+    }
+    let end10 = unsafe { _rdtsc() };
+    info!("KernelAlloc 500 allocations: {} tsc (avg: {} tsc per allocation)",
+        end10 - start10, (end10 - start10) as f64 / 100.0);
+
+    let start11 = unsafe { _rdtsc() };
+    let _ = Box::new([0u8; 4096]);
+    let end11 = unsafe { _rdtsc() };
+    info!("KernelAlloc 4KB: {} tsc", end11 - start11);
+
+
 }
 
 //FOR ME ONLY
