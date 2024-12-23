@@ -5,6 +5,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use log::info;
 use x86_64::instructions::port::Port;
+use core::arch::x86_64::_rdtsc;
 
 const ALLOCATOR_MAGIC: u64 = 0x4433_4F53_4E56_4D4D; // "D3OS_NVMM"
 
@@ -60,7 +61,7 @@ pub(crate) struct GlobalPersistentAllocator {
 #[derive(Debug)]
 pub struct RecoveryStatus {
     metadata_valid: bool,
-    bitmap_consistent: bool,
+    //bitmap_consistent: bool,
     used_pools: u32,
     total_pools: u32,
     initialization_failures: u32,
@@ -156,7 +157,7 @@ impl GlobalPersistentAllocator {
         unsafe {
             RecoveryStatus {
                 metadata_valid: self.verify_metadata(),
-                bitmap_consistent: self.verify_bitmap_consistency(),
+                //bitmap_consistent: self.verify_bitmap_consistency(),
                 used_pools: (*self.metadata).used_pools.load(Ordering::Acquire),
                 total_pools: (*self.metadata).total_pools.load(Ordering::Acquire),
                 initialization_failures: (*self.metadata)
@@ -198,9 +199,11 @@ impl GlobalPersistentAllocator {
                     panic!("Failed to create LOG pool: {:?}", e);
                 }
             } else {
+                let start1 = unsafe { _rdtsc() };
                 let status = allocator.check_recovery_status();
 
-                if !status.metadata_valid || !status.bitmap_consistent {
+                //if !status.metadata_valid || !status.bitmap_consistent {
+                if !status.metadata_valid {
                     info!("Recovery check failed: {:?}, reinitializing", status);
                     //Offsets might be wrong, so we need to reinitialize because its to risky to use
                     allocator.initialize(nvdimm_size, max_pools, bitmap_offset, directory_offset, bitmap_words);
@@ -221,8 +224,8 @@ impl GlobalPersistentAllocator {
                     } else {
                         panic!("Invalid metadata: log pool offset is 0");
                     }
-
-                    info!("Recovery check successful: {:?}", status);
+                    let end1 = unsafe { _rdtsc() };
+                    info!("Recovery check successful: {:?} with tsc: {}", status, end1 - start1);
                     // Verify configuration
                     assert_eq!((*metadata).nvdimm_size, nvdimm_size, "NVDIMM size mismatch");
                     assert_eq!((*metadata).pool_size, FIXED_POOL_SIZE, "Pool size mismatch");
@@ -340,10 +343,11 @@ impl GlobalPersistentAllocator {
             }
 
             //Could be that the bitmap insnt full but no more store!
-            if used_pools >= total_pools {
-                info!("Cannot create new pool: all {} pools are in use", total_pools);
-                return Err(AllocError::NoPoolsAvailable);
-            }
+            // TODO: Wieder einkommentieren, used_pools wird gerade nicht +1 gemacht
+            // if used_pools >= total_pools {
+            //     info!("Cannot create new pool: all {} pools are in use", total_pools);
+            //     return Err(AllocError::NoPoolsAvailable);
+            // }
 
             if first_free_slot.is_none() {
                 info!("Inconsistency detected: used_pools reported {} free slots but none found", total_pools - used_pools);

@@ -249,25 +249,31 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
 
 
             //clear_nvram(nvram_base, nvram_size);
+            let warm1 = unsafe { _rdtsc()};
+            let end1 = unsafe { _rdtsc()};
+            info!("Warmup time {} tsc", end1 - warm1);
 
-            let timer_start = timer.systime_ms();
+
             let start = unsafe { _rdtsc()};
             let allocator = GlobalPersistentAllocator::new(nvram_base, nvram_size);
             let end = unsafe { _rdtsc()};
-            let timer_end = timer.systime_ms();
+
             info!("Time taken to create allocator: {} tsc", end - start);
-            info!("Time taken to create allocator: {} ms", timer_end - timer_start);
+            //info!("Time taken to create allocator: {} ms", timer_end - timer_start);
             info!("About to store allocator in global storage");
             init_persistent_allocator(allocator);
 
             let mut allocator = persistent_allocator().write();
 
 
-            //run_all_tests(&mut allocator);
+            run_all_tests(&mut allocator);
+            //test_fragmentation_allocation_overhead(&mut allocator);
+            //test_stress(&mut allocator);
+            //messure_deallocations(&mut allocator);
             //test_basic_data_types(&mut allocator);
-            measure_performance_time(&mut allocator);
-            //test_crash_recovery(&mut allocator);
+            //measure_performance_time(&mut allocator);
             //test_linked_list(&mut allocator);
+            //test_crash_recovery(&mut allocator);
             //test_full_usage_allocator(&mut allocator);
             //test_pool_limits(&mut allocator);
 
@@ -284,13 +290,14 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             //
             // //pool.debug_print_object_table();
             //
-            //
+
             // match pool.transaction(|tx| {
-            //     //let a = tx.get_by_id::<u64>("data")?;
+            //     let a = tx.get_by_id::<u64>("data")?;
             //     //tx.modify(a, |n| *n += 1)?;
-            //     let mut a = tx.allocate_with_id("data", 48879u64)?;
+            //     //tx.allocate_with_id("data1", 48879u64)?;
+            //     //let mut a = tx.allocate_with_id("data2", 48880u64)?;
             //     //tx.deallocate_by_id("data")?;
-            //
+            //     //loop {}
             //     //qemu_exit(123);
             //     Ok(())
             // }) {
@@ -576,12 +583,15 @@ fn run_all_tests(allocator: &mut GlobalPersistentAllocator) {
     test_basic_data_types(allocator);
     test_memory_pressure(allocator);
     test_type_safety(allocator);
-    test_edge_cases(allocator);
+    test_stress(allocator);
+    test_fragmentation_allocation_overhead(allocator);
     test_linked_list(allocator);
     test_list_modifications(allocator);
     test_list_stress(allocator);
     test_pool_limits(allocator);
     measure_performance_time(allocator);
+    messure_deallocations(allocator);
+
 
 
     info!("All tests and measurement completed successfully!");
@@ -933,6 +943,234 @@ fn measure_performance_time(allocator: &mut GlobalPersistentAllocator) {
     let _ = Box::new([0u8; 4096]);
     let end11 = unsafe { _rdtsc() };
     info!("KernelAlloc 4KB: {} tsc", end11 - start11);
+}
+
+fn messure_deallocations(allocator: &mut GlobalPersistentAllocator) {
+    info!("=== Testing Deallocation ===");
+    let pool = allocator.get_or_create_pool(b"DEALLOCATION_TEST").unwrap();
+
+    // 1. Basic Operations
+    info!("8byte deallocation");
+    pool.transaction(|tx| {
+        tx.allocate_with_id("small1", SmallObject { id: 1, active: true })?;
+        let start1 = unsafe { _rdtsc() };
+        tx.deallocate_by_id("small1")?;
+        let end1 = unsafe { _rdtsc() };
+        info!("8byte deallocation: {} tsc", end1 - start1);
+        Ok(())
+    }).expect("Deallocation failed");
+
+    info!("4KB deallocation");
+    pool.transaction(|tx| {
+
+        tx.allocate_with_id("large1", LargeObject { id: 1, data: [1; 4096] })?;
+        let start2 = unsafe { _rdtsc() };
+        tx.deallocate_by_id("large1")?;
+        let end2 = unsafe { _rdtsc() };
+        info!("4KB deallocation: {} tsc", end2 - start2);
+        Ok(())
+    }).expect("Deallocation failed");
+
+    info!("100 8byte deallocations");
+    pool.transaction(|tx| {
+        for i in 0..100 {
+            tx.allocate_with_id(&format!("small{}", i), SmallObject { id: i as u32, active: true })?;
+        }
+        let start3 = unsafe { _rdtsc() };
+        for i in 0..100 {
+            tx.deallocate_by_id(&format!("small{}", i))?;
+        }
+        let end3 = unsafe { _rdtsc() };
+        info!("100 8byte deallocations: {} tsc (avg: {} tsc per deallocation)",
+            end3 - start3, (end3 - start3) as f64 / 100.0
+        );
+        Ok(())
+    }).expect("Deallocation failed");
+
+    info!("200 8byte deallocations");
+    pool.transaction(|tx| {
+        for i in 0..200 {
+            tx.allocate_with_id(&format!("small{}", i), SmallObject { id: i as u32, active: true })?;
+        }
+        let start4 = unsafe { _rdtsc() };
+        for i in 0..200 {
+            tx.deallocate_by_id(&format!("small{}", i))?;
+        }
+        let end4 = unsafe { _rdtsc() };
+        info!("200 8byte deallocations: {} tsc (avg: {} tsc per deallocation)",
+            end4 - start4, (end4 - start4) as f64 / 200.0
+        );
+        Ok(())
+    }).expect("Deallocation failed");
+
+    info!("500 8byte deallocations");
+    pool.transaction(|tx| {
+        for i in 0..500 {
+            tx.allocate_with_id(&format!("small{}", i), SmallObject { id: i as u32, active: true })?;
+        }
+        let start5 = unsafe { _rdtsc() };
+        for i in 0..500 {
+            tx.deallocate_by_id(&format!("small{}", i))?;
+        }
+        let end5 = unsafe { _rdtsc() };
+        info!("500 8byte deallocations: {} tsc (avg: {} tsc per deallocation)",
+            end5 - start5, (end5 - start5) as f64 / 500.0
+        );
+        Ok(())
+    }).expect("Deallocation failed");
+
+    info!("Now for Kernelheap");
+
+
+    let test1 = Box::new(1u64);
+    let start6 = unsafe { _rdtsc() };
+    drop(test1);
+    let end6 = unsafe { _rdtsc() };
+    info!("KernelAlloc 8bytes: {} tsc", end6 - start6);
+
+
+    let test2 = Box::new([0u8; 4096]);
+    let kb64start = unsafe { _rdtsc() };
+    drop(test2);
+    let kb64end = unsafe { _rdtsc() };
+    info!("KernelAlloc 4KB: {} tsc", kb64end - kb64start);
+
+    // Test 100 deallocations
+    {
+        let boxes: Vec<Box<u64>> = (0..100).map(|i| Box::new(i)).collect();
+        let start = unsafe { _rdtsc() };
+        drop(boxes);
+        let end = unsafe { _rdtsc() };
+        info!("KernelDealloc 100 deallocations: {} tsc (avg: {} tsc per deallocation)",
+        end - start, (end - start) as f64 / 100.0);
+    }
+
+    // Test 200 deallocations
+    {
+        let boxes: Vec<Box<u64>> = (0..200).map(|i| Box::new(i)).collect();
+        let start = unsafe { _rdtsc() };
+        drop(boxes);
+        let end = unsafe { _rdtsc() };
+        info!("KernelDealloc 200 deallocations: {} tsc (avg: {} tsc per deallocation)",
+        end - start, (end - start) as f64 / 200.0);
+    }
+
+    // Test 500 deallocations
+    {
+        let boxes: Vec<Box<u64>> = (0..500).map(|i| Box::new(i)).collect();
+        let start = unsafe { _rdtsc() };
+        drop(boxes);
+        let end = unsafe { _rdtsc() };
+        info!("KernelDealloc 500 deallocations: {} tsc (avg: {} tsc per deallocation)",
+        end - start, (end - start) as f64 / 500.0);
+    }
+
+}
+
+fn test_fragmentation_allocation_overhead(allocator: &mut GlobalPersistentAllocator) {
+    info!("=== Testing Fragmentation Allocation Overhead ===");
+    let pool = allocator.get_or_create_pool(b"FRAG_OVERHEAD").unwrap();
+
+    // Different sized objects
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct SmallBlock {
+        id: u64,
+        data: [u8; 16 * 1000], // 16KB
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct MediumBlock {
+        id: u64,
+        data: [u8; 32 * 1000], // 32KB
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct LargeBlock {
+        id: u64,
+        data: [u8; 64 * 1000], // 64KB
+    }
+
+
+    // 1. Create initial fragmented state
+    info!("Step 1: Creating initial fragmented state");
+    // Calculate overhead
+    info!("=== Performance Analysis ===");
+    info!("Memory layout before final allocation:");
+    info!("- Large block (64KB)");
+    info!("- Free space (16KB) - First hole");
+    info!("- Large block (64KB)");
+    info!("- Free space (32KB) - Second hole");
+    info!("- Large block (64KB)");
+    info!("- Free space (16KB) - Third hole");
+
+    pool.transaction(|tx| {
+        // Allocate in pattern: Large, Small, Large, Medium, Large, Small
+        let start = unsafe { _rdtsc() };
+        tx.allocate_with_id("large_1", LargeBlock { id: 1, data: [1; 64 * 1000] })?;
+        tx.allocate_with_id("small_1", SmallBlock { id: 2, data: [2; 16 * 1000] })?;
+        tx.allocate_with_id("large_2", LargeBlock { id: 3, data: [3; 64 * 1000] })?;
+        tx.allocate_with_id("medium_1", MediumBlock { id: 4, data: [4; 32 * 1000] })?;
+        tx.allocate_with_id("large_3", LargeBlock { id: 5, data: [5; 64 * 1000] })?;
+        tx.allocate_with_id("small_2", SmallBlock { id: 6, data: [6; 16 * 1000] })?;
+        let end = unsafe { _rdtsc() };
+        info!("Time to create initial state: {} tsc", end - start);
+        Ok(())
+    }).expect("Initial allocation failed");
+
+    info!("Initial state created");
+
+    // 2. Create fragmentation by deallocating specific blocks
+    info!("Step 2: Creating fragmentation");
+
+    pool.transaction(|tx| {
+        // Delete some blocks to create fragmented free space
+        let start = unsafe { _rdtsc() };
+        tx.deallocate_by_id("small_1")?;  // Creates 16KB hole
+        tx.deallocate_by_id("medium_1")?; // Creates 32KB hole
+        tx.deallocate_by_id("small_2")?;  // Creates 16KB hole
+        let end = unsafe { _rdtsc() };
+        info!("Time to create 64 kb(16 , 32, 16) fragmentation: {} tsc", end - start);
+        Ok(())
+    }).expect("Deallocation failed");
+
+
+   // pool.debug_print_object_table();
+    info!("Fragmentation created");
+
+    // 3. Try to allocate a block that won't fit in first free space
+    info!("Step 3: Allocating block that needs to skip first free space");
+    pool.transaction(|tx| {
+        // Try to allocate a medium block (32KB) - should skip the first 16KB hole
+        let start = unsafe { _rdtsc() };
+        tx.allocate_with_id(
+            "medium_new",
+            MediumBlock { id: 7, data: [7; 32 * 1000] }
+        )?;
+        let end = unsafe { _rdtsc() };
+        info!("Time to allocate with fragmentation: {} tsc", end - start);
+        Ok(())
+    }).expect("New allocation failed");
+
+    info!("Final state after allocation");
+
+    // 4. Compare with allocation in clean pool
+    info!("Step 4: Comparing with allocation in clean pool");
+    let clean_pool = allocator.get_or_create_pool(b"CLEAN_POOL").unwrap();
+
+    clean_pool.transaction(|tx| {
+        let start = unsafe { _rdtsc() };
+        tx.allocate_with_id(
+            "medium_clean",
+            MediumBlock { id: 8, data: [8; 32 * 1000] }
+        )?;
+        let end = unsafe { _rdtsc() };
+        info!("Time to allocate in clean pool: {} tsc", end - start);
+        Ok(())
+    }).expect("Clean allocation failed");
+
 
 
 }
@@ -1295,6 +1533,7 @@ fn test_linked_list(allocator: &mut GlobalPersistentAllocator) {
     }).expect("Failed to initialize list");
 
     // // 2. Add nodes
+    let start1 = unsafe { _rdtsc() };
     for i in 1..=5 {
         pool.transaction(|tx| {
             let mut list = tx.read_by_id::<LinkedList>("list")?;
@@ -1329,6 +1568,8 @@ fn test_linked_list(allocator: &mut GlobalPersistentAllocator) {
             Ok(())
         }).expect("Failed to add node");
     }
+    let end1 = unsafe { _rdtsc() };
+    info!("Adding 5 nodes: {} tsc", end1 - start1);
 
 
     // 4. Print list (after recovery)
@@ -1421,21 +1662,27 @@ fn test_list_stress(allocator: &mut GlobalPersistentAllocator) {
 }
 
 
-fn test_edge_cases(allocator: &mut GlobalPersistentAllocator) {
+fn test_stress(allocator: &mut GlobalPersistentAllocator) {
     info!("=== Testing Edge Cases ===");
     let pool = allocator.get_or_create_pool(b"EDGE_CASES").unwrap();
 
     //1. Alloc Delloc multiply times
-    pool.transaction(|tx| {
-        for i in 0..100 {
-            tx.allocate_with_id(&format!("alloc{}", i), SmallObject { id: i, active: true })?;
-            tx.deallocate_by_id(&format!("alloc{}", i))?;
-        }
-        for i in 0..100 {
 
-        }
-        Ok(())
-    }).expect("Allocation deallocation test failed");
+    for i in 0..100 {
+        let start1 = unsafe { _rdtsc() };
+        pool.transaction(|tx| {
+            for i in 0..512 {
+                tx.allocate_with_id(&format!("alloc{}", i), SmallObject { id: i, active: true })?;
+                tx.deallocate_by_id(&format!("alloc{}", i))?;
+            }
+            Ok(())
+        }).expect("Allocation deallocation test failed");
+        let end1 = unsafe { _rdtsc() };
+        info!("{}. Alloc Delloc 512 times: {} tsc", i,end1 - start1);
+    }
+
+
+
 
 }
 

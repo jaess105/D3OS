@@ -141,6 +141,7 @@ impl Pool {
     }
 
     // Transaction handling
+    // DOC: Der Stil der Clojuers ist Corundum nachempfunden
     pub fn transaction<F, R>(&mut self, f: F) -> Result<R, PoolError>
     where
         F: FnOnce(&mut TransactionContext) -> Result<R, PoolError>,
@@ -158,18 +159,19 @@ impl Pool {
             };
 
             if has_logs {
-                info!("Systemcrash happend inside a Rollback .. Continue with rollback");
+                info!("Systemcrash happened inside a Rollback .. Continue with rollback");
                 Self::perform_rollback(log_pool.base_address)?;
                 Self::empty_log_pool(log_pool.base_address);
             }
 
-            // Clear log pool for new transaction
-            // log_pool.empty_log_pool();
          }
 
         // Always check for recovery at start of transaction
         //DOC: Hier wird  der Tatsächliche Speicher gelöscht
+        let start1 = unsafe { _rdtsc() };
         self.recover()?;
+        let end1 = unsafe { _rdtsc() };
+        //info!("Recovery took {} cycles", end1 - start1);
 
         let mut ctx = TransactionContext {
             pool: self,
@@ -222,7 +224,6 @@ impl Pool {
                 //  Active |  Valid |  OperationDone -> Alles super -> nothing happens
 
                 if !entry.active.load(Ordering::Acquire) && entry.valid.load(Ordering::Acquire) && entry.operation_done.load(Ordering::Acquire) {
-                    //info!("Regular Deallocation");
                     //TODO: EVLT IST DIESE FN useless??
 
                     Self::deallocate(self, entry.data.unwrap(), Layout::from_size_align(entry.type_size, 64).unwrap());
@@ -247,12 +248,15 @@ impl Pool {
                 }
 
                 if !entry.active.load(Ordering::Acquire) && !entry.valid.load(Ordering::Acquire) && entry.operation_done.load(Ordering::Acquire) {
-                    //info!(">> LOG HAS FAILED << !DANGEROUS STATE!");
-
+                    let start1 = unsafe { _rdtsc() };
                     Self::deallocate(self, entry.data.unwrap(), Layout::from_size_align(entry.type_size, 64).unwrap());
-                    entry.active.store(false, Ordering::Release);
+                    let end1 = unsafe { _rdtsc() };
+
+                    //8bytes wirte atomic
+                    //entry.active.store(false, Ordering::Release);
 
                     // Clear all entry data
+                    let start2 = unsafe { _rdtsc() };
                     entry.data = None;
                     entry.type_hash = 0;
                     entry.type_size = 0;
@@ -262,12 +266,15 @@ impl Pool {
                         32
                     );
                     entry.id_len = 0;
+                    let end2 = unsafe { _rdtsc() };
+
+                    Self::flush_cache_line(entry as *mut ObjectTableEntry as *const ObjectTableEntry as *const u8);
 
                     // Mark entry as inactive
-                    entry.active.store(false, Ordering::Release);
-                    entry.valid.store(false, Ordering::Release);
+                    //entry.active.store(false, Ordering::Release);
+                    //entry.valid.store(false, Ordering::Release);
                     entry.operation_done.store(false, Ordering::Release);
-
+                    //<<<<<<info!("Deallocation took {} cycles, cacheflush {} cycles", end1 - start1, end2 - start2);
                 }
 
                 if entry.active.load(Ordering::Acquire) && !entry.valid.load(Ordering::Acquire) {
@@ -293,7 +300,6 @@ impl Pool {
                             }
                         }
 
-                        //Self::deallocate(self, entry.data.unwrap(), Layout::from_size_align(entry.type_size, 64).unwrap());
                         entry.active.store(false, Ordering::Release);
 
                         // Clear all entry data
@@ -306,10 +312,9 @@ impl Pool {
                             32
                         );
                         entry.id_len = 0;
+                        Self::flush_cache_line(entry as *mut ObjectTableEntry as *const ObjectTableEntry as *const u8);
 
                         // Mark entry as inactive
-                        entry.active.store(false, Ordering::Release);
-                        entry.valid.store(false, Ordering::Release);
                         entry.operation_done.store(false, Ordering::Release);
 
                         //Pool::flush_cache_line(entry as *const u8);
@@ -792,6 +797,28 @@ impl<'a> TransactionContext<'a> {
 
                     if entry_id == id {
                         // Found existing entry - modify it
+                        // But before check type hash
+                        let expected_hash = Pool::compute_type_hash::<T>();
+                        if entry.type_hash != expected_hash {
+                            info!("Type mismatch for ID: {}", id);
+                            //   TODO: Bug! paniced obwohl deallociert wurde! Erst nach schreiben fixxen!
+                            // entry.active.store(false, Ordering::Release);
+                            // entry.valid.store(false, Ordering::Release);
+                            // entry.operation_done.store(false, Ordering::Release);
+                            //    nach Dieser Zeile!!!
+                            // self.pool.deallocate(entry.data.unwrap(), Layout::from_size_align(entry.type_size, 8).unwrap());
+                            // entry.data = None;
+                            // entry.type_hash = 0;
+                            // entry.type_size = 0;
+                            // ptr::write_bytes(
+                            //     entry.id.as_mut_ptr(),
+                            //     0,
+                            //     32
+                            // );
+                            //self.pool.flush_cache_line(entry as *const _ as *const u8);
+
+                            return self.allocate_with_id(id, data);
+                        }
                         self.modify(entry.data.unwrap().cast(), |existing| *existing = data).expect("Modify failed");
                         return Ok(entry.data.unwrap().cast());
                     }
@@ -950,7 +977,7 @@ impl<'a> TransactionContext<'a> {
             // Also mark the operation done
             //(*entry).valid.store(false, Ordering::Release);
             (*entry).operation_done.store(false, Ordering::Release);
-            Pool::flush_cache_line(entry as *const _ as *const u8);
+            //Pool::flush_cache_line(entry as *const _ as *const u8);
 
             //DOC: Log the modification BEFORE making it visible
             //info!("Starting to Modify in Log");
@@ -967,11 +994,9 @@ impl<'a> TransactionContext<'a> {
             //DOC: Wird einfach überschrieben..
             f(&mut *ptr.as_ptr());
             //TODO: HIER NOCHMAL über cache flush nachdenken!
-
-
-            (*entry).operation_done.store(true, Ordering::Release);
             Pool::flush_cache_line(ptr.as_ptr() as *const u8);
 
+            (*entry).operation_done.store(true, Ordering::Release);
 
             // Add to pending changes if not already there
             if !self.pending_changes.iter().any(|c| c.entry == entry) {
