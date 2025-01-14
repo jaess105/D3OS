@@ -31,7 +31,6 @@ use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address};
 use smoltcp::wire::IpAddress::Ipv4;
 use uefi::mem::memory_map::MemoryMap;
 use uefi::data_types::Handle;
-use uefi::runtime::Time;
 use uefi_raw::table::boot::MemoryType;
 use uefi_raw::table::system::SystemTable;
 use x86_64::instructions::interrupts;
@@ -53,7 +52,7 @@ use crate::device::serial::SerialPort;
 use crate::memory::{MemorySpace, nvmem, PAGE_SIZE};
 use crate::memory::global_persistent_allocator::{AllocError, GlobalPersistentAllocator, qemu_exit};
 use crate::memory::nvmem::Nfit;
-use crate::memory::pool::{Pool, PoolError};
+use crate::memory::pool::PoolError;
 use crate::memory::r#virtual::page_table_index;
 use crate::network::rtl8139;
 
@@ -226,8 +225,7 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
     // As a demo for NVRAM support, we read the last boot time from NVRAM and write the current boot time to it
     if let Ok(nfit) = acpi_tables().lock().find_table::<Nfit>() {
         if let Some(range) = nfit.get_phys_addr_ranges().first() {
-            let date_ptr = range.as_phys_frame_range().start.start_address().as_u64() as *mut Time;
-
+            //let date_ptr = range.as_phys_frame_range().start.start_address().as_u64() as *mut Time;
             // Read last boot time from NVRAM
             // let date = unsafe { date_ptr.read() };
             // if date.is_valid().is_ok() {
@@ -242,31 +240,33 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             // }
 
 
-
             let nvram_base = range.as_phys_frame_range().start.start_address().as_u64();
             let nvram_size = (range.as_phys_frame_range().end - range.as_phys_frame_range().start)
                 as usize * PAGE_SIZE;
 
-
-            //clear_nvram(nvram_base, nvram_size);
-            let warm1 = unsafe { _rdtsc()};
-            let end1 = unsafe { _rdtsc()};
-            info!("Warmup time {} tsc", end1 - warm1);
-
-
-            let start = unsafe { _rdtsc()};
             let allocator = GlobalPersistentAllocator::new(nvram_base, nvram_size);
-            let end = unsafe { _rdtsc()};
-
-            info!("Time taken to create allocator: {} tsc", end - start);
-            //info!("Time taken to create allocator: {} ms", timer_end - timer_start);
-            info!("About to store allocator in global storage");
             init_persistent_allocator(allocator);
 
+            //Can also be called outside this scope with the exact same line!
             let mut allocator = persistent_allocator().write();
 
+            let pool = allocator.get_or_create_pool(b"POOL1").unwrap();
 
-            run_all_tests(&mut allocator);
+            match pool.transaction(|tx| {
+                //let a = tx.get_by_id::<u64>("data1")?;
+                //tx.modify(a, |n| *n += 1)?;
+                tx.allocate_with_id("data1", 48879u64)?;
+                //Let Qemu crash.
+                //If you test this. try the get_by_id function and see that the transaction fails correctly
+                //qemu_exit(1);
+                Ok(())
+            }) {
+                Ok(_) => info!("Transaction successful"),
+                Err(e) => info!("Transaction failed Correctly: {:?}", e),
+            };
+
+
+            //run_all_tests(&mut allocator);
             //test_fragmentation_allocation_overhead(&mut allocator);
             //test_stress(&mut allocator);
             //messure_deallocations(&mut allocator);
@@ -274,51 +274,8 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             //measure_performance_time(&mut allocator);
             //test_linked_list(&mut allocator);
             //test_crash_recovery(&mut allocator);
-            //test_full_usage_allocator(&mut allocator);
             //test_pool_limits(&mut allocator);
-
-
-            //
-            //allocator.release_pool(b"RECOVERY_TEST");
-            //let pool = allocator.get_or_create_pool(b"RECOVERY_TEST").unwrap();
-            //pool.debug_print_object_table();
-            //let pool = allocator.get_or_create_pool(b"POOL1").unwrap();
-
-
-            //allocator.release_pool(b"RECOVERY_TEST");
-            //let pool = allocator.get_or_create_pool(b"RECOVERY_TEST").unwrap();
-            //
-            // //pool.debug_print_object_table();
-            //
-
-            // match pool.transaction(|tx| {
-            //     let a = tx.get_by_id::<u64>("data")?;
-            //     //tx.modify(a, |n| *n += 1)?;
-            //     //tx.allocate_with_id("data1", 48879u64)?;
-            //     //let mut a = tx.allocate_with_id("data2", 48880u64)?;
-            //     //tx.deallocate_by_id("data")?;
-            //     //loop {}
-            //     //qemu_exit(123);
-            //     Ok(())
-            // }) {
-            //     Ok(_) => info!("Transaction successful"),
-            //     Err(e) => info!("Transaction failed Correctly: {:?}", e),
-            // }
-
-
-            //let pool1 = allocator.get_or_create_pool(b"RECOVERY_TEST").unwrap();
-
-            //
-            // match pool.transaction(|tx| {
-            //     tx.get_by_id::<u64>("data")?;
-            //     Ok(())
-            // }) {
-            //     Ok(_) => info!("Transaction successful"),
-            //     Err(e) => info!("Transaction failed Correctly: {:?}", e),
-            // }
-
-
-            //pool.debug_print_object_table();
+            //test_full_usage_allocator(&mut allocator);
 
         }
     }
@@ -583,6 +540,7 @@ fn run_all_tests(allocator: &mut GlobalPersistentAllocator) {
     test_basic_data_types(allocator);
     test_memory_pressure(allocator);
     test_type_safety(allocator);
+    test_crash_recovery(allocator);
     test_stress(allocator);
     test_fragmentation_allocation_overhead(allocator);
     test_linked_list(allocator);
@@ -659,17 +617,6 @@ fn test_multiple_pools(allocator: &mut GlobalPersistentAllocator) {
             Ok(())
         }).expect("Pool 2 test failed");
     }
-
-    // Test Pool 3
-    //DOC: wiederverwendbar
-    //TODO: Auch matchen:D gerade kb
-    {
-        allocator.release_pool(b"POOL1");
-        let pool3 = allocator.get_or_create_pool(b"POOL3").unwrap();
-        //pool3.debug_print_object_table();
-    }
-
-
 }
 
 fn test_basic_data_types(allocator: &mut GlobalPersistentAllocator) {
@@ -678,7 +625,7 @@ fn test_basic_data_types(allocator: &mut GlobalPersistentAllocator) {
 
     // Test string storage
     #[repr(C)]
-    #[derive(Copy, Clone)]
+    #[derive(Copy, Clone, Debug)]
     struct PersistentString {
         length: usize,
         data: [u8; 64],  // Fixed size buffer
@@ -730,7 +677,7 @@ fn test_basic_data_types(allocator: &mut GlobalPersistentAllocator) {
         Ok(())
     }).expect("Failed to store numeric types");
 
-    // Read and verify all types -> TODO: real matches
+    // Read read types
     pool.transaction(|tx| {
         // Read integers
         info!("int8: {}", tx.read_by_id::<i8>("int8")?);
@@ -745,7 +692,8 @@ fn test_basic_data_types(allocator: &mut GlobalPersistentAllocator) {
         // Read boolean
         info!("bool_true: {}", tx.read_by_id::<bool>("bool_true")?);
         info!("bool_false: {}", tx.read_by_id::<bool>("bool_false")?);
-
+        assert_eq!(tx.read_by_id::<bool>("bool_true")?, true);
+        assert_eq!(tx.read_by_id::<bool>("bool_false")?, false);
         // Read character
         info!("char: {}", tx.read_by_id::<char>("char")?);
 
@@ -794,10 +742,7 @@ fn test_basic_data_types(allocator: &mut GlobalPersistentAllocator) {
     //should not exist
     pool.transaction(|tx| {
         if let Ok(pers_str) = tx.read_by_id::<PersistentString>("crash_string") {
-            // let recovered_str = core::str::from_utf8(&pers_str.data[..pers_str.length])
-            //     .expect("Invalid UTF-8");
-            // info!("Recovered string after crash: {}", recovered_str);
-            panic!("String should not exist after crash");
+            panic!("String should not exist after crash {:?}", pers_str);
         }
         Ok(())
     }).expect("Failed to verify after crash");
@@ -912,6 +857,7 @@ fn measure_performance_time(allocator: &mut GlobalPersistentAllocator) {
     //Compare with KernelAlloc
     let start7 = unsafe { _rdtsc() };
     let _ = Box::new(1u64);
+
     let end7 = unsafe { _rdtsc() };
     info!("KernelAlloc 8bytes: {} tsc", end7 - start7);
 
@@ -929,7 +875,7 @@ fn measure_performance_time(allocator: &mut GlobalPersistentAllocator) {
     }
     let end9 = unsafe { _rdtsc() };
     info!("KernelAlloc 200 allocations: {} tsc (avg: {} tsc per allocation)",
-        end8 - start8, (end8 - start8) as f64 / 100.0);
+        end9 - start9, (end9 - start9) as f64 / 100.0);
 
     let start10 = unsafe { _rdtsc() };
     for i in 0..500 {
@@ -1198,7 +1144,7 @@ fn test_full_usage_allocator(allocator: &mut GlobalPersistentAllocator) {
     }
 }
 
-/// IMPORTANT: **Call this fn only if pools have exactly 4MB of storage**
+/// IMPORTANT: **Call this fn only if pools have exactly 4MB of POOL_SIZE**
 /// Description: Test pool Storage Limits
 ///
 ///
@@ -1400,12 +1346,6 @@ fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
         Ok(())
     }).expect("Recovery verification failed");
 
-    pool.transaction(|tx| {
-        tx.allocate_with_id("mytest", 4225u64)?;
-        Ok(())
-    }).expect("Initial allocation failed");
-
-    //pool.debug_print_object_table();
 
     //2. Test recovery after modification crash
     info!("Test 2: Recovery after modification crash");
@@ -1679,39 +1619,5 @@ fn test_stress(allocator: &mut GlobalPersistentAllocator) {
         }).expect("Allocation deallocation test failed");
         let end1 = unsafe { _rdtsc() };
         info!("{}. Alloc Delloc 512 times: {} tsc", i,end1 - start1);
-    }
-
-
-
-
-}
-
-fn tsc_to_ns(tsc_ticks: u64) -> u64 {
-    // CPU frequency in Hz (2.4 GHz)
-    const CPU_FREQUENCY_HZ: u64 = 2_400_000_000;
-
-    (tsc_ticks * 1_000_000_000) / CPU_FREQUENCY_HZ
-}
-
-fn clear_nvram(base_address: u64, size: usize) {
-    unsafe {
-        info!("Clearing NVRAM from 0x{:x} to 0x{:x}", base_address, base_address + size as u64);
-
-        // Zero out all memory
-        ptr::write_bytes(
-            base_address as *mut u8,
-            0,
-            size
-        );
-
-        // Ensure everything is flushed to NVRAM
-        for offset in (0..size).step_by(64) {  // Step by cache line size
-            core::arch::x86_64::_mm_clflush((base_address as *const u8).add(offset));
-        }
-
-        // Final fence to ensure all flushes are complete
-        core::arch::x86_64::_mm_sfence();
-
-        info!("NVRAM cleared successfully");
     }
 }

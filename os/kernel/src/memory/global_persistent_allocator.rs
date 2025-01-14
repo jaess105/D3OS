@@ -44,7 +44,6 @@ pub(crate) struct PoolDirectoryEntry {
     _padding: [u8; 8],  // Adjusted padding to maintain alignment
 }
 
-// Bitmap to track pool states
 #[repr(C)]
 struct PoolBitmap {
     initialized_bits: [AtomicU64; 0], // Zero-sized array, actual size determined at runtime
@@ -61,10 +60,7 @@ pub(crate) struct GlobalPersistentAllocator {
 #[derive(Debug)]
 pub struct RecoveryStatus {
     metadata_valid: bool,
-    //bitmap_consistent: bool,
-    used_pools: u32,
-    total_pools: u32,
-    initialization_failures: u32,
+    bitmap_consistent: bool,
 }
 
 #[derive(Debug)]
@@ -92,81 +88,26 @@ fn calculate_max_pools(nvdimm_size: usize) -> usize {
 
     let max_pools = available_space / space_per_pool;
 
+    info!("Max pools: {}", max_pools);
+
     // Round down to multiple of 64 for bitmap alignment
     max_pools & !(63)
 }
 
-///Calculates the maximum number of pools that can be created on the NVDIMM
-/// based on the available space and the fixed pool size.
-///
-/// This function is more precise than the calculate_max_pools function.
-/// It calculates the exact number of pools that can be created on the NVDIMM.
-fn calculate_max_pools_precise(nvdimm_size: usize) -> Option<usize> {
-    // Constants for clarity
-    const MIN_REQUIRED_SIZE: usize = size_of::<GlobalMetadata>() + // Minimum for metadata
-            FIXED_POOL_SIZE +             // At least one pool
-            size_of::<PoolDirectoryEntry>() + // One directory entry
-            16; // One bitmap word (for up to 64 pools)
-
-    // Early validation
-    if nvdimm_size < MIN_REQUIRED_SIZE {
-        return None; // NVDIMM too small for even one pool
-    }
-
-    let metadata_size = size_of::<GlobalMetadata>();
-    let directory_entry_size = size_of::<PoolDirectoryEntry>();
-
-    // Start with maximum theoretical pools
-    let mut pools = (nvdimm_size - metadata_size) / (FIXED_POOL_SIZE + directory_entry_size + 1);
-
-    // Round down to multiple of 64 for bitmap alignment
-    pools = pools & !(63);
-
-    // Verify with exact calculations
-    while pools > 0 {
-        let bitmap_words = (pools + 63) / 64;
-        let bitmap_size = bitmap_words * 16; // 2 bitmaps * 8 bytes per word
-
-        let total_needed = metadata_size +                    // Global metadata
-                (pools * FIXED_POOL_SIZE) +       // Actual pools
-                (pools * directory_entry_size) +   // Directory entries
-                bitmap_size; // Bitmap space
-
-        // Add alignment padding to be extra safe
-        let total_with_padding = (total_needed + 4095) & !4095; // 4KB alignment
-
-        if total_with_padding <= nvdimm_size {
-            // Double-check our numbers
-            debug_assert!(pools % 64 == 0, "Pools must be multiple of 64");
-            debug_assert!(
-                total_with_padding > total_needed,
-                "Padding calculation error"
-            );
-
-            return Some(pools);
-        }
-
-        pools -= 64;
-    }
-
-    None // Could not find valid configuration
-}
-
 impl GlobalPersistentAllocator {
     fn check_recovery_status(&self) -> RecoveryStatus {
-        unsafe {
-            RecoveryStatus {
-                metadata_valid: self.verify_metadata(),
-                //bitmap_consistent: self.verify_bitmap_consistency(),
-                used_pools: (*self.metadata).used_pools.load(Ordering::Acquire),
-                total_pools: (*self.metadata).total_pools.load(Ordering::Acquire),
-                initialization_failures: (*self.metadata)
-                    .initialization_failures
-                    .load(Ordering::Acquire),
-            }
+        RecoveryStatus {
+            metadata_valid: self.verify_metadata(),
+            bitmap_consistent: self.verify_bitmap_consistency(),
         }
     }
 
+    /// Creates a new global allocator instance at the specified NVRAM base address.
+    /// Attempts to recover existing data if possible, otherwise initializes fresh metadata.
+    ///
+    /// # Arguments
+    /// * `base_address` - The starting address of the NVRAM region
+    /// * `nvdimm_size` - Total size of the NVRAM in bytes
     pub fn new(base_address: u64, nvdimm_size: usize) -> Self {
         if FIXED_POOL_SIZE < 65 * 1024 {
             panic!("Pool size too small, must be at least 65KB");
@@ -174,7 +115,6 @@ impl GlobalPersistentAllocator {
 
         let metadata = base_address as *mut GlobalMetadata;
 
-        //let max_pools = calculate_max_pools_precise(nvdimm_size).unwrap();
 
         let max_pools = calculate_max_pools(nvdimm_size);
         let bitmap_words = (max_pools + 63) / 64; // ceiling division by 64
@@ -199,11 +139,11 @@ impl GlobalPersistentAllocator {
                     panic!("Failed to create LOG pool: {:?}", e);
                 }
             } else {
-                let start1 = unsafe { _rdtsc() };
+                let start1 = _rdtsc();
                 let status = allocator.check_recovery_status();
 
-                //if !status.metadata_valid || !status.bitmap_consistent {
-                if !status.metadata_valid {
+                if !status.metadata_valid || !status.bitmap_consistent {
+                //if !status.metadata_valid {
                     info!("Recovery check failed: {:?}, reinitializing", status);
                     //Offsets might be wrong, so we need to reinitialize because its to risky to use
                     allocator.initialize(nvdimm_size, max_pools, bitmap_offset, directory_offset, bitmap_words);
@@ -224,14 +164,14 @@ impl GlobalPersistentAllocator {
                     } else {
                         panic!("Invalid metadata: log pool offset is 0");
                     }
-                    let end1 = unsafe { _rdtsc() };
+                    let end1 = _rdtsc();
                     info!("Recovery check successful: {:?} with tsc: {}", status, end1 - start1);
                     // Verify configuration
                     assert_eq!((*metadata).nvdimm_size, nvdimm_size, "NVDIMM size mismatch");
-                    assert_eq!((*metadata).pool_size, FIXED_POOL_SIZE, "Pool size mismatch");
                 }
             }
         }
+        //Can be used to see the completed Metadata
         allocator.print_metadata_debug_info();
         allocator
     }
@@ -275,6 +215,7 @@ impl GlobalPersistentAllocator {
         }
     }
 
+
     fn get_bitmap_word(&self, is_used: bool, index: usize) -> &AtomicU64 {
         unsafe {
             let bitmap_words = (*self.metadata).bitmap_words;
@@ -309,7 +250,14 @@ impl GlobalPersistentAllocator {
         (word.load(Ordering::SeqCst) & mask) != 0
     }
 
-    /// Creates a new pool or recovers an existing one
+    /// Creates or retrieves an existing memory pool with the specified name.
+    ///
+    /// # Arguments
+    /// * `name` - Unique identifier for the pool (max 63 bytes)
+    ///
+    /// # Returns
+    /// * `Ok(Pool)` - Reference to the created/existing pool
+    /// * `Err(AllocError)` - If pool creation fails
     pub fn get_or_create_pool(&mut self, name: &[u8]) -> Result<&mut Pool, AllocError> {
         if name.len() >= 64 || name.len() <= 0 {
             return Err(AllocError::NameTooLongOrShort);
@@ -343,11 +291,10 @@ impl GlobalPersistentAllocator {
             }
 
             //Could be that the bitmap insnt full but no more store!
-            // TODO: Wieder einkommentieren, used_pools wird gerade nicht +1 gemacht
-            // if used_pools >= total_pools {
-            //     info!("Cannot create new pool: all {} pools are in use", total_pools);
-            //     return Err(AllocError::NoPoolsAvailable);
-            // }
+            if used_pools >= total_pools {
+                info!("Cannot create new pool: all {} pools are in use", total_pools);
+                return Err(AllocError::NoPoolsAvailable);
+            }
 
             if first_free_slot.is_none() {
                 info!("Inconsistency detected: used_pools reported {} free slots but none found", total_pools - used_pools);
@@ -365,20 +312,19 @@ impl GlobalPersistentAllocator {
             // Prepare new entry
             let mut new_entry = PoolDirectoryEntry {
                 name: [0; 64],
-                //pool: Some(Pool::new(pool_address, FIXED_POOL_SIZE, self.log_pool_address)),
                 pool: Some(Pool::new(pool_address, FIXED_POOL_SIZE)), //test
                 _padding: [0; 8],
             };
             ptr::copy_nonoverlapping(name.as_ptr(), new_entry.name.as_mut_ptr(), name.len());
-            new_entry.name[name.len()] = 0; //DOC: Null-terminate
+            new_entry.name[name.len()] = 0; //Null-terminate
 
             // Write and persist entry
-            //DOC Reserve -> part of allocation
+            // Reserve -> part of allocation
             ptr::write_volatile(entry, new_entry);
             core::arch::x86_64::_mm_clflush(entry as *const PoolDirectoryEntry as *const u8);
 
             // Set both bits in bitmap
-            // DOC: Activation -> now able to find!
+            // Activation -> now able to find!
             let word_index = index / BITS_PER_WORD;
             let bit_index = index % BITS_PER_WORD;
             let mask = 1u64 << bit_index;
@@ -393,6 +339,11 @@ impl GlobalPersistentAllocator {
             // Flush bitmap updates
             core::arch::x86_64::_mm_clflush(init_word as *const AtomicU64 as *const u8);
             core::arch::x86_64::_mm_clflush(used_word as *const AtomicU64 as *const u8);
+
+            //update metdata
+            (*self.metadata).used_pools.fetch_add(1, Ordering::Release);
+            (*self.metadata).total_allocations.fetch_add(1, Ordering::Release);
+
 
             // Final fence
             core::arch::x86_64::_mm_sfence();
@@ -416,11 +367,12 @@ impl GlobalPersistentAllocator {
 
                     //info!("Creating log pool at address: 0x{:x}", pool_address);
 
-                    // DOC: RESERVE
+                    // RESERVE
                     // Initialize the static log pool first
                     Pool::init_log_pool(pool_address);
 
                     // Create directory entry
+                    // Just to take the space, the Entry will be not used.
                     let mut new_entry = PoolDirectoryEntry {
                         name: [0; 64],
                         pool: None,
@@ -438,7 +390,7 @@ impl GlobalPersistentAllocator {
                     core::arch::x86_64::_mm_clflush(entry as *const PoolDirectoryEntry as *const u8);
                     core::arch::x86_64::_mm_sfence();
 
-                    // DOC ACTIVATE
+                    // ACTIVATE
                     // Update bitmap and entry
                     self.set_bit(i, true, true);
                     self.set_bit(i, false, true);
@@ -447,6 +399,9 @@ impl GlobalPersistentAllocator {
                     (*self.metadata).log_pool_offset = pool_address - self.base_address;
                     (*self.metadata).used_pools.fetch_add(1, Ordering::Release);
                     (*self.metadata).initialized_pools.fetch_add(1, Ordering::Release);
+                    (*self.metadata).total_allocations.fetch_add(1, Ordering::Release);
+
+
 
                     return Ok(());
                 }
@@ -455,6 +410,19 @@ impl GlobalPersistentAllocator {
         }
     }
 
+    /// Releases a memory pool and frees its resources.
+    /// This operation invalidates the pool's magic number, clears its data, and updates allocation metadata.
+    /// The LOG pool cannot be released.
+    ///
+    /// # Arguments
+    /// * `name` - Name/identifier of the pool to release
+    ///
+    /// # Returns
+    /// * `true` - If pool was successfully released
+    /// * `false` - If pool wasn't found or is the LOG pool
+    ///
+    /// # Safety
+    /// Ensure no other parts of the program are using the pool before releasing it.
     pub fn release_pool(&mut self, name: &[u8]) -> bool {
         if name.len() >= 64 || name.len() <= 0 {
             return false;
@@ -467,12 +435,11 @@ impl GlobalPersistentAllocator {
         unsafe {
             let total_pools = (*self.metadata).total_pools.load(Ordering::Acquire);
             for i in 0..total_pools {
-                //TODO: NOch überlegen ob es hier sinn macht, könnte sein, dass pool reserved aber nicht aktiviert wurde..
                 if self.is_bit_set(i as usize, true) {
                     let entry = &mut *self.pool_directory.add(i as usize);
                     if self.compare_name(name, &entry.name) {
                         info!("Pool found! Releasing pool: {}",core::str::from_utf8(name).unwrap());
-                        // Directly invalidate the pool's magic number
+
                         if let Some(pool) = &mut entry.pool {
                             // Use ptr::write_volatile to write to the header's magic field
                             ptr::write_volatile(&mut (*pool.header).magic as *mut u64, 0);
@@ -508,10 +475,6 @@ impl GlobalPersistentAllocator {
     }
 
     fn get_pool_data_offset(&self) -> u64 {
-        //info!("Calculating pool data offset:");
-        //info!("  pool_directory_offset: 0x{:x}", unsafe { (*self.metadata).pool_directory_offset });
-        //info!("  total_pools: {}", unsafe { (*self.metadata).total_pools.load(Ordering::Relaxed)  });
-        //info!("  sizeof PoolDirectoryEntry: {}",mem::size_of::<PoolDirectoryEntry>());
         let offset = unsafe {
             // Remove self.base_address from here
             (*self.metadata).pool_directory_offset
@@ -544,30 +507,6 @@ impl GlobalPersistentAllocator {
         }
     }
 
-    fn persist_bitmap_word(&self, pool_index: usize, is_used: bool) {
-        let word_index = pool_index / BITS_PER_WORD;
-        let word = self.get_bitmap_word(is_used, word_index);
-
-        unsafe {
-            core::arch::x86_64::_mm_sfence();
-            core::arch::x86_64::_mm_clflush(word as *const _ as *const u8);
-            core::arch::x86_64::_mm_sfence();
-        }
-    }
-
-    fn persist_metadata_counters(&self) {
-        unsafe {
-            let metadata = &*self.metadata;
-            core::arch::x86_64::_mm_sfence();
-
-            // Flush the atomic counters
-            core::arch::x86_64::_mm_clflush(&metadata.used_pools as *const _ as *const u8);
-            core::arch::x86_64::_mm_clflush(&metadata.initialized_pools as *const _ as *const u8);
-            core::arch::x86_64::_mm_clflush(&metadata.total_allocations as *const _ as *const u8);
-
-            core::arch::x86_64::_mm_sfence();
-        }
-    }
 
     fn verify_metadata(&self) -> bool {
         unsafe {
@@ -651,9 +590,8 @@ impl GlobalPersistentAllocator {
             info!("Bitmap words: {}", (*self.metadata).bitmap_words);
 
             info!("=== Log Pool Information ===");
-            if let log = (*self.metadata).log_pool_offset {
-                info!("Log pool offset: 0x{:x}", log);
-            }
+
+            info!("Log pool offset: 0x{:x}", (*self.metadata).log_pool_offset);
 
             // Statistics
             info!("=== Statistics ===");
@@ -674,19 +612,11 @@ impl GlobalPersistentAllocator {
             info!("==============================");
         }
     }
-
-    pub fn print_bitmap(&self) {
-        unsafe {
-            let total_pools = (*self.metadata).total_pools.load(Ordering::Acquire);
-            for i in 0..total_pools {
-                let used = self.is_bit_set(i as usize, true);
-                let initialized = self.is_bit_set(i as usize, false);
-                info!("Pool {}: initialized: {}, used: {}", i, initialized, used);
-            }
-        }
-    }
 }
 
+//quelle: https://os.phil-opp.com/integration-tests/
+
+/// Exit QEMU with the specified exit code.
 pub(crate) fn qemu_exit(exit_code: u32) -> ! {
     unsafe {
         let mut port = Port::new(0xf4);

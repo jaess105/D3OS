@@ -21,7 +21,6 @@ use crate::syscall::sys_concurrent::{sys_process_execute_binary, sys_process_exi
     sys_thread_id, sys_thread_join, sys_thread_sleep, sys_thread_switch,};
 use crate::syscall::sys_terminal::{sys_terminal_read, sys_terminal_write};
 use crate::syscall::sys_naming::sys_mkdir;
-use crate::syscall::sys_persistent::*;
 
 use crate::{core_local_storage, tss};
 
@@ -100,9 +99,6 @@ impl SyscallTable {
                 sys_get_date as *const _,
                 sys_set_date as *const _,
                 sys_mkdir as *const _,
-                sys_create_persistent_pool as *const _,
-                sys_release_persistent_pool as *const _,
-                sys_perform_transaction as *const _,
             ],
         }
     }
