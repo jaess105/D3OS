@@ -269,16 +269,24 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
 
             allocator.print_active_pools();
 
-
             //run_all_tests(&mut allocator);
+
+            //Test these functions individually
+            //-------------------------------
             //test_fragmentation_allocation_overhead(&mut allocator);
-            //test_stress(&mut allocator);
             //messure_deallocations(&mut allocator);
             //test_basic_data_types(&mut allocator);
             //measure_performance_time(&mut allocator);
             //test_linked_list(&mut allocator);
             //test_crash_recovery(&mut allocator);
+
+            //*IMPORTANT* Stresstests. USE WITH 4MB FIXED_POOL_SIZE ONLY!
+            //-------------------------------
             //test_pool_limits(&mut allocator);
+            //test_stress(&mut allocator);
+
+            //Allocates maximum amount Pools - Starting with ID "POOL1"
+            //-------------------------------
             //test_full_usage_allocator(&mut allocator);
 
         }
@@ -545,12 +553,12 @@ fn run_all_tests(allocator: &mut GlobalPersistentAllocator) {
     test_memory_pressure(allocator);
     test_type_safety(allocator);
     test_crash_recovery(allocator);
-    test_stress(allocator);
     test_fragmentation_allocation_overhead(allocator);
     test_linked_list(allocator);
     test_list_modifications(allocator);
     test_list_stress(allocator);
-    test_pool_limits(allocator);
+    //ONLY call this test set the FIXED_POOL_SIZE to 4MB
+    //test_pool_limits(allocator);
     measure_performance_time(allocator);
     messure_deallocations(allocator);
 
@@ -1605,7 +1613,7 @@ fn test_list_stress(allocator: &mut GlobalPersistentAllocator) {
     }
 }
 
-
+//Only used for the stress test in thesis use more than 2MB for this!
 fn test_stress(allocator: &mut GlobalPersistentAllocator) {
     info!("=== Testing Edge Cases ===");
     let pool = allocator.get_or_create_pool(b"EDGE_CASES").unwrap();
@@ -1613,7 +1621,7 @@ fn test_stress(allocator: &mut GlobalPersistentAllocator) {
     //1. Alloc Delloc multiply times
 
     for i in 0..100 {
-        let start1 = unsafe { _rdtsc() };
+        //let start1 = unsafe { _rdtsc() };
         pool.transaction(|tx| {
             for i in 0..512 {
                 tx.allocate_with_id(&format!("alloc{}", i), SmallObject { id: i, active: true })?;
@@ -1622,6 +1630,7 @@ fn test_stress(allocator: &mut GlobalPersistentAllocator) {
             Ok(())
         }).expect("Allocation deallocation test failed");
         let end1 = unsafe { _rdtsc() };
-        info!("{}. Alloc Delloc 512 times: {} tsc", i,end1 - start1);
+        //info!("{}. Alloc Delloc 512 times: {} tsc", i,end1 - start1);
     }
+    info!("Alloc Delloc 512 times: Done");
 }

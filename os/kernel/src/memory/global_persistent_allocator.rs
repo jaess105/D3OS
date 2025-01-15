@@ -13,6 +13,9 @@ const ALLOCATOR_MAGIC: u64 = 0x4433_4F53_4E56_4D4D; // "D3OS_NVMM"
 /// DO NOT SET THIS SMALLER THAN 65Kb ! Space for metadata needed
 pub const FIXED_POOL_SIZE: usize = (1024 * 1024) * 4; // 4MB
 
+//Zu demo zwecken
+//pub const FIXED_POOL_SIZE: usize = 1024 * 512; // 512 Kb
+
 const BITS_PER_WORD: usize = 64;
 const METADATA_SIZE: usize = core::mem::size_of::<GlobalMetadata>();
 const DIRECTORY_ALIGNMENT: usize = 8;
@@ -87,8 +90,6 @@ fn calculate_max_pools(nvdimm_size: usize) -> usize {
     let space_per_pool = FIXED_POOL_SIZE + entry_size + (16.0 / 64.0) as usize;
 
     let max_pools = available_space / space_per_pool;
-
-    info!("Max pools: {}", max_pools);
 
     // Round down to multiple of 64 for bitmap alignment
     max_pools & !(63)
@@ -172,7 +173,7 @@ impl GlobalPersistentAllocator {
             }
         }
         //Can be used to see the completed Metadata
-        allocator.print_metadata_debug_info();
+        //allocator.print_metadata_debug_info();
         allocator
     }
 
