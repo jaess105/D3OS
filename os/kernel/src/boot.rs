@@ -267,6 +267,8 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
                 Err(e) => info!("Transaction failed Correctly: {:?}", e),
             };
 
+            allocator.print_active_pools();
+
 
             //run_all_tests(&mut allocator);
             //test_fragmentation_allocation_overhead(&mut allocator);

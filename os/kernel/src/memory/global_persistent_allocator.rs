@@ -612,6 +612,37 @@ impl GlobalPersistentAllocator {
             info!("==============================");
         }
     }
+
+    pub fn print_active_pools(&self) {
+        unsafe {
+            let total_pools = (*self.metadata).total_pools.load(Ordering::Acquire);
+            let used_pools = (*self.metadata).used_pools.load(Ordering::Acquire);
+
+            info!("=== Active Pools Overview ===");
+            info!("Total pools capacity: {}", total_pools);
+            info!("Currently used pools: {}", used_pools);
+
+            let mut active_count = 0;
+            for i in 0..total_pools as usize {
+                if self.is_bit_set(i, true) {
+                    let entry = &*self.pool_directory.add(i);
+                    // Find null terminator in name
+                    let name_len = entry.name.iter()
+                        .position(|&x| x == 0)
+                        .unwrap_or(entry.name.len());
+
+                    let name = core::str::from_utf8(&entry.name[..name_len])
+                        .unwrap_or("[Invalid UTF-8]");
+
+                    info!("Pool #{}: \"{}\"", i, name);
+                    active_count += 1;
+                }
+            }
+
+            info!("Total active pools found: {}", active_count);
+            info!("===========================");
+        }
+    }
 }
 
 //quelle: https://os.phil-opp.com/integration-tests/
