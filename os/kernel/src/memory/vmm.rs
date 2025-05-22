@@ -14,7 +14,6 @@
 */
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cmp::Ordering;
 use core::fmt;
 use log::info;
 use spin::RwLock;
@@ -30,7 +29,6 @@ use crate::memory::frames;
 use crate::memory::frames::phys_limit;
 use crate::memory::pages::Paging;
 use crate::memory::{MemorySpace, PAGE_SIZE};
-use crate::process_manager;
 
 /*static LAST_VIRT_ADDR: Once<Mutex<Cell<VirtAddr>>> = Once::new();
 
@@ -125,9 +123,11 @@ impl VirtualAddressSpace {
 
     /// Return all vmas with the given type `typ` in his address space.
     pub fn find_vmas<F>(&self, typ: VmaType, f: F)
-        where F: FnMut(&VirtualMemoryArea)
+    where
+        F: FnMut(&VirtualMemoryArea),
     {
-        self.virtual_memory_areas.read()
+        self.virtual_memory_areas
+            .read()
             .iter()
             .filter(|area| area.typ() == typ)
             .for_each(f);
@@ -182,11 +182,11 @@ impl VirtualAddressSpace {
         let page_count = pages_to_alloc.len();
         let frames = frames::alloc(page_count as usize);
 
-      /*  info!(
-            "map_and_allocate: page_count: {:?}, pages: {:?}, frames: {:?}",
-            page_count, pages, frames
-        );
-*/
+        /*  info!(
+                    "map_and_allocate: page_count: {:?}, pages: {:?}, frames: {:?}",
+                    page_count, pages, frames
+                );
+        */
         let vma = VirtualMemoryArea::new_with_tag(pages, mem_type, tag_str);
         self.add_vma(vma);
         // TODO: this allocates the whole VMA and not just pages_to_alloc
@@ -228,7 +228,7 @@ impl VirtualAddressSpace {
         flags: PageTableFlags,
     ) {
         let page_count = frames.len();
-    /*   info!(
+        /*   info!(
             "map_physical: vma: {:?}, frames: {:?}, page_count: {:?}",
             vma, frames, page_count
         );*/

@@ -41,8 +41,7 @@ use acpi::AcpiTables;
 use alloc::sync::Arc;
 use core::fmt::Arguments;
 use core::panic::PanicInfo;
-use ::log::{error, info, Level, Log, Record};
-use acpi::AcpiTables;
+use ::log::{info};
 use multiboot2::ModuleTag;
 use spin::{Mutex, Once, RwLock};
 use tar_no_std::TarArchiveRef;
@@ -52,12 +51,7 @@ use x86_64::structures::idt::InterruptDescriptorTable;
 use x86_64::structures::paging::PhysFrame;
 use x86_64::structures::paging::frame::PhysFrameRange;
 use x86_64::structures::tss::TaskStateSegment;
-use x86_64::PhysAddr;
-use crate::device::pci::PciBus;
 use crate::memory::global_persistent_allocator::GlobalPersistentAllocator;
-use crate::memory::PAGE_SIZE;
-use crate::process::process::ProcessManager;
-use crate::syscall::syscall_dispatcher::CoreLocalStorage;
 
 extern crate alloc;
 

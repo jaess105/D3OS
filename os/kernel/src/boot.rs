@@ -7,73 +7,23 @@
    ║ Author: Fabian Ruhland & Michael Schoettner, HHU                        ║
    ╚═════════════════════════════════════════════════════════════════════════╝
 */
-use alloc::boxed::Box;
 use crate::interrupt::interrupt_dispatcher;
-use crate::{naming, init_persistent_allocator, persistent_allocator};
-use crate::syscall::syscall_dispatcher;
-use crate::process::thread::Thread;
-use alloc::format;
-use alloc::string::ToString;
-use alloc::sync::Arc;
-use alloc::vec::Vec;
-use core::arch::x86_64::_rdtsc;
-use core::ffi::c_void;
-use core::mem::size_of;
-use core::ops::Deref;
-use core::ptr;
-use chrono::DateTime;
-use log::{debug, info, warn, LevelFilter};
-use multiboot2::{BootInformation, BootInformationHeader, EFIMemoryMapTag, MemoryAreaType, MemoryMapTag, TagHeader};
-use smoltcp::iface;
-use smoltcp::iface::Interface;
-use smoltcp::time::Instant;
-use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address};
-use smoltcp::wire::IpAddress::Ipv4;
-use uefi::mem::memory_map::MemoryMap;
-use uefi::data_types::Handle;
-use uefi_raw::table::boot::MemoryType;
-use uefi_raw::table::system::SystemTable;
-use x86_64::instructions::interrupts;
-use x86_64::instructions::segmentation::{Segment, CS, DS, ES, FS, GS, SS};
-use x86_64::instructions::tables::load_tss;
-use x86_64::{PhysAddr, VirtAddr};
-use x86_64::registers::segmentation::SegmentSelector;
-use x86_64::structures::gdt::Descriptor;
-use x86_64::structures::paging::{Page, PageTable, PageTableFlags, PhysFrame};
-use x86_64::PrivilegeLevel::Ring0;
-use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags};
-use x86_64::structures::paging::frame::PhysFrameRange;
-use x86_64::structures::paging::page::PageRange;
-use crate::{acpi_tables, allocator, apic, built_info, gdt, init_acpi_tables, init_apic, init_initrd, init_pci, init_serial_port, init_terminal, initrd, keyboard, logger, memory, network, process_manager, scheduler, serial_port, terminal, timer, tss};
-
-use crate::device::pit::Timer;
-use crate::device::ps2::Keyboard;
-use crate::device::qemu_cfg;
-use crate::device::serial::SerialPort;
-use crate::memory::{MemorySpace, nvmem, PAGE_SIZE};
-use crate::memory::global_persistent_allocator::{AllocError, GlobalPersistentAllocator, qemu_exit};
-use crate::memory::nvmem::Nfit;
-use crate::memory::pool::PoolError;
-use crate::memory::r#virtual::page_table_index;
-use crate::interrupt::interrupt_dispatcher;
-use crate::memory::nvmem::Nfit;
-use crate::memory::pages::page_table_index;
-use crate::memory::vmm::{VirtualMemoryArea, VmaType};
-use crate::memory::{MemorySpace, PAGE_SIZE, nvmem};
-use crate::network::rtl8139;
 use crate::process::thread::Thread;
 use crate::syscall::syscall_dispatcher;
 use crate::{
-    acpi_tables, allocator, apic, built_info, gdt, init_cpu_info, init_acpi_tables, init_apic, init_initrd,
+    acpi_tables, allocator, apic, built_info, gdt, init_acpi_tables, init_apic, init_initrd,
     init_pci, init_serial_port, init_terminal, initrd, keyboard, logger, memory, network,
     process_manager, scheduler, serial_port, terminal, timer, tss,
 };
-use crate::{efi_services_available, naming, storage};
+use crate::{init_persistent_allocator, naming, persistent_allocator};
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use chrono::DateTime;
+use uefi::runtime::Time;
+use core::arch::x86_64::_rdtsc;
 use core::ffi::c_void;
 use core::mem::size_of;
 use core::ops::Deref;
@@ -90,7 +40,6 @@ use smoltcp::wire::IpAddress::Ipv4;
 use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address};
 use uefi::data_types::Handle;
 use uefi::mem::memory_map::MemoryMap;
-use uefi::runtime::Time;
 use uefi_raw::table::boot::MemoryType;
 use uefi_raw::table::system::SystemTable;
 use x86_64::PrivilegeLevel::Ring0;
@@ -104,6 +53,20 @@ use x86_64::structures::paging::frame::PhysFrameRange;
 use x86_64::structures::paging::page::PageRange;
 use x86_64::structures::paging::{Page, PageTable, PageTableFlags, PhysFrame};
 use x86_64::{PhysAddr, VirtAddr};
+
+use crate::device::pit::Timer;
+use crate::device::ps2::Keyboard;
+use crate::device::qemu_cfg;
+use crate::device::serial::SerialPort;
+use crate::init_cpu_info;
+use crate::memory::global_persistent_allocator::{AllocError, GlobalPersistentAllocator};
+use crate::memory::nvmem::Nfit;
+use crate::memory::pages::page_table_index;
+use crate::memory::pool::PoolError;
+use crate::memory::vmm::{VirtualMemoryArea, VmaType};
+use crate::memory::{MemorySpace, PAGE_SIZE, nvmem};
+use crate::network::rtl8139;
+use crate::storage;
 
 // import labels from linker script 'link.ld'
 unsafe extern "C" {
@@ -184,7 +147,10 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
     )
     .unwrap();
     let vma = VirtualMemoryArea::new_with_tag(
-        PageRange { start: fb_start_page, end: fb_end_page },
+        PageRange {
+            start: fb_start_page,
+            end: fb_end_page,
+        },
         VmaType::DeviceMemory,
         "framebuffer",
     );
@@ -338,7 +304,7 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
     // As a demo for NVRAM support, we read the last boot time from NVRAM and write the current boot time to it
     if let Ok(nfit) = acpi_tables().lock().find_table::<Nfit>() {
         if let Some(range) = nfit.get_phys_addr_ranges().first() {
-            //let date_ptr = range.as_phys_frame_range().start.start_address().as_u64() as *mut Time;
+            let date_ptr = range.as_phys_frame_range().start.start_address().as_u64() as *mut Time;
             // Read last boot time from NVRAM
             // let date = unsafe { date_ptr.read() };
             // if date.is_valid().is_ok() {
@@ -352,10 +318,10 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
             //     }
             // }
 
-
             let nvram_base = range.as_phys_frame_range().start.start_address().as_u64();
             let nvram_size = (range.as_phys_frame_range().end - range.as_phys_frame_range().start)
-                as usize * PAGE_SIZE;
+                as usize
+                * PAGE_SIZE;
 
             let allocator = GlobalPersistentAllocator::new(nvram_base, nvram_size);
             init_persistent_allocator(allocator);
@@ -411,7 +377,6 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
                     date.second()
                 );
             }
-
         }
     }
 
@@ -466,7 +431,7 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
         bootloader_name
     );
 
-    // Dump information about all processes (including VMAs) 
+    // Dump information about all processes (including VMAs)
     process_manager().read().dump();
 
     // Start APIC timer & scheduler
@@ -728,9 +693,8 @@ struct LargeObject {
 #[derive(Copy, Clone)]
 struct HugeObject {
     id: u64,
-    data: [u8; 1000*64], // less than 1MB ,object table always takes 0x10040 bytes-> so we have less than 2MB
+    data: [u8; 1000 * 64], // less than 1MB ,object table always takes 0x10040 bytes-> so we have less than 2MB
 }
-
 
 // Main test runner
 fn run_all_tests(allocator: &mut GlobalPersistentAllocator) {
@@ -749,11 +713,8 @@ fn run_all_tests(allocator: &mut GlobalPersistentAllocator) {
     measure_performance_time(allocator);
     messure_deallocations(allocator);
 
-
-
     info!("All tests and measurement completed successfully!");
 }
-
 
 // Test Scenarios
 fn test_single_pool(allocator: &mut GlobalPersistentAllocator) {
@@ -763,21 +724,46 @@ fn test_single_pool(allocator: &mut GlobalPersistentAllocator) {
     // 1. Basic Operations
     info!("Test 1: Basic Operations");
     pool.transaction(|tx| {
-        tx.allocate_with_id("small1", SmallObject { id: 1, active: true })?;
-        tx.allocate_with_id("medium1", MediumObject {
-            id: 1,
-            name: *b"TestObject\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
-            data: [0; 256],
-        })?;
-        tx.allocate_with_id("large1", LargeObject {
-            id: 1,
-            data: [0; 1024 * 4],
-        })?;
+        tx.allocate_with_id(
+            "small1",
+            SmallObject {
+                id: 1,
+                active: true,
+            },
+        )?;
+        tx.allocate_with_id(
+            "medium1",
+            MediumObject {
+                id: 1,
+                name: *b"TestObject\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+                data: [0; 256],
+            },
+        )?;
+        tx.allocate_with_id(
+            "large1",
+            LargeObject {
+                id: 1,
+                data: [0; 1024 * 4],
+            },
+        )?;
         tx.deallocate_by_id("small1")?;
-        tx.allocate_with_id("small2", SmallObject { id: 2, active: false })?;
-        tx.allocate_with_id("small1", SmallObject { id: 123, active: true })?;
+        tx.allocate_with_id(
+            "small2",
+            SmallObject {
+                id: 2,
+                active: false,
+            },
+        )?;
+        tx.allocate_with_id(
+            "small1",
+            SmallObject {
+                id: 123,
+                active: true,
+            },
+        )?;
         Ok(())
-    }).expect("Basic operations test failed");
+    })
+    .expect("Basic operations test failed");
 
     //verify
     pool.transaction(|tx| {
@@ -793,7 +779,8 @@ fn test_single_pool(allocator: &mut GlobalPersistentAllocator) {
         assert_eq!(medium1.id, 1);
         assert_eq!(large1.id, 1);
         Ok(())
-    }).expect("Basic operations verification failed");
+    })
+    .expect("Basic operations verification failed");
 }
 
 fn test_multiple_pools(allocator: &mut GlobalPersistentAllocator) {
@@ -802,19 +789,23 @@ fn test_multiple_pools(allocator: &mut GlobalPersistentAllocator) {
     // Test Pool 1
     {
         let pool1 = allocator.get_or_create_pool(b"POOL1").unwrap();
-        pool1.transaction(|tx| {
-            tx.allocate_with_id("pool1_data", 42u64)?;
-            Ok(())
-        }).expect("Pool 1 test failed");
+        pool1
+            .transaction(|tx| {
+                tx.allocate_with_id("pool1_data", 42u64)?;
+                Ok(())
+            })
+            .expect("Pool 1 test failed");
     }
 
     // Test Pool 2
     {
         let pool2 = allocator.get_or_create_pool(b"POOL2").unwrap();
-        pool2.transaction(|tx| {
-            tx.allocate_with_id("pool2_data", 84u64)?;
-            Ok(())
-        }).expect("Pool 2 test failed");
+        pool2
+            .transaction(|tx| {
+                tx.allocate_with_id("pool2_data", 84u64)?;
+                Ok(())
+            })
+            .expect("Pool 2 test failed");
     }
 }
 
@@ -827,7 +818,7 @@ fn test_basic_data_types(allocator: &mut GlobalPersistentAllocator) {
     #[derive(Copy, Clone, Debug)]
     struct PersistentString {
         length: usize,
-        data: [u8; 64],  // Fixed size buffer
+        data: [u8; 64], // Fixed size buffer
     }
 
     pool.transaction(|tx| {
@@ -842,16 +833,18 @@ fn test_basic_data_types(allocator: &mut GlobalPersistentAllocator) {
         tx.allocate_with_id("test_string", pers_str)?;
         info!("Stored string successfully");
         Ok(())
-    }).expect("Failed to store string");
+    })
+    .expect("Failed to store string");
 
     // Read string back
     pool.transaction(|tx| {
         let pers_str = tx.read_by_id::<PersistentString>("test_string")?;
-        let recovered_str = core::str::from_utf8(&pers_str.data[..pers_str.length])
-            .expect("Invalid UTF-8");
+        let recovered_str =
+            core::str::from_utf8(&pers_str.data[..pers_str.length]).expect("Invalid UTF-8");
         info!("Recovered string: {}", recovered_str);
         Ok(())
-    }).expect("Failed to read string");
+    })
+    .expect("Failed to read string");
 
     // Test different numeric types
     pool.transaction(|tx| {
@@ -874,7 +867,8 @@ fn test_basic_data_types(allocator: &mut GlobalPersistentAllocator) {
 
         info!("Stored all numeric types successfully");
         Ok(())
-    }).expect("Failed to store numeric types");
+    })
+    .expect("Failed to store numeric types");
 
     // Read read types
     pool.transaction(|tx| {
@@ -897,7 +891,8 @@ fn test_basic_data_types(allocator: &mut GlobalPersistentAllocator) {
         info!("char: {}", tx.read_by_id::<char>("char")?);
 
         Ok(())
-    }).expect("Failed to read numeric types");
+    })
+    .expect("Failed to read numeric types");
 
     // Test array storage
     pool.transaction(|tx| {
@@ -911,7 +906,8 @@ fn test_basic_data_types(allocator: &mut GlobalPersistentAllocator) {
 
         info!("Stored arrays successfully");
         Ok(())
-    }).expect("Failed to store arrays");
+    })
+    .expect("Failed to store arrays");
 
     // Read arrays back
     pool.transaction(|tx| {
@@ -921,7 +917,8 @@ fn test_basic_data_types(allocator: &mut GlobalPersistentAllocator) {
         let matrix = tx.read_by_id::<[[i32; 3]; 3]>("matrix")?;
         info!("Recovered matrix: {:?}", matrix);
         Ok(())
-    }).expect("Failed to read arrays");
+    })
+    .expect("Failed to read arrays");
 
     // Test crash recovery with string
     pool.transaction(|tx| {
@@ -936,7 +933,8 @@ fn test_basic_data_types(allocator: &mut GlobalPersistentAllocator) {
         info!("Stored string before crash");
 
         Err::<(), PoolError>(PoolError::TransactionFailed)
-    }).expect_err("Transaction should fail");
+    })
+    .expect_err("Transaction should fail");
 
     //should not exist
     pool.transaction(|tx| {
@@ -944,7 +942,8 @@ fn test_basic_data_types(allocator: &mut GlobalPersistentAllocator) {
             panic!("String should not exist after crash {:?}", pers_str);
         }
         Ok(())
-    }).expect("Failed to verify after crash");
+    })
+    .expect("Failed to verify after crash");
 }
 
 fn test_memory_pressure(allocator: &mut GlobalPersistentAllocator) {
@@ -955,11 +954,15 @@ fn test_memory_pressure(allocator: &mut GlobalPersistentAllocator) {
         for i in 0..10 {
             tx.allocate_with_id(
                 &format!("large{}", i),
-                LargeObject { id: i as u64, data: [i as u8; 1024 * 4] }
+                LargeObject {
+                    id: i as u64,
+                    data: [i as u8; 1024 * 4],
+                },
             )?;
         }
         Ok(())
-    }).expect("Memory pressure test failed");
+    })
+    .expect("Memory pressure test failed");
 
     //pool.debug_print_object_table();
 }
@@ -971,7 +974,8 @@ fn test_type_safety(allocator: &mut GlobalPersistentAllocator) {
     pool.transaction(|tx| {
         tx.allocate_with_id("type_test", 42u64)?;
         Ok(())
-    }).expect("Type safety test failed");
+    })
+    .expect("Type safety test failed");
 
     pool.transaction(|tx| {
         // This should fail with type mismatch
@@ -981,7 +985,8 @@ fn test_type_safety(allocator: &mut GlobalPersistentAllocator) {
             _ => info!("Type safety check failed"),
         }
         Ok(())
-    }).expect("Type safety test failed");
+    })
+    .expect("Type safety test failed");
     //pool.debug_print_object_table();
 }
 
@@ -1002,7 +1007,8 @@ fn measure_performance_time(allocator: &mut GlobalPersistentAllocator) {
         let end2 = unsafe { _rdtsc() };
         info!("Single allocation 8bytes : {} tsc", end2 - start2);
         Ok(())
-    }).expect("Single allocation failed");
+    })
+    .expect("Single allocation failed");
 
     // Measure bulk allocations
     pool.transaction(|tx| {
@@ -1011,11 +1017,14 @@ fn measure_performance_time(allocator: &mut GlobalPersistentAllocator) {
             tx.allocate_with_id(&format!("bulk{}", i), i as u64)?;
         }
         let end3 = unsafe { _rdtsc() };
-        info!("100 allocations: {} tsc (avg: {} tsc per allocation)",
-        end3-start3, (end3-start3) as f64 / 100.0
-    );
+        info!(
+            "100 allocations: {} tsc (avg: {} tsc per allocation)",
+            end3 - start3,
+            (end3 - start3) as f64 / 100.0
+        );
         Ok(())
-    }).expect("Bulk allocation failed");
+    })
+    .expect("Bulk allocation failed");
 
     pool.transaction(|tx| {
         let start5 = unsafe { _rdtsc() };
@@ -1023,11 +1032,14 @@ fn measure_performance_time(allocator: &mut GlobalPersistentAllocator) {
             tx.allocate_with_id(&format!("bulk{}", i), i as u64)?;
         }
         let end5 = unsafe { _rdtsc() };
-        info!("200 allocations: {} tsc (avg: {} tsc per allocation)",
-        end5-start5, (end5-start5) as f64 / 100.0
-    );
+        info!(
+            "200 allocations: {} tsc (avg: {} tsc per allocation)",
+            end5 - start5,
+            (end5 - start5) as f64 / 100.0
+        );
         Ok(())
-    }).expect("Bulk allocation failed");
+    })
+    .expect("Bulk allocation failed");
 
     pool.transaction(|tx| {
         let start6 = unsafe { _rdtsc() };
@@ -1035,23 +1047,30 @@ fn measure_performance_time(allocator: &mut GlobalPersistentAllocator) {
             tx.allocate_with_id(&format!("bulk{}", i), i as u64)?;
         }
         let end6 = unsafe { _rdtsc() };
-        info!("500 allocations: {} tsc (avg: {} tsc per allocation)",
-        end6-start6, (end6-start6) as f64 / 100.0
-    );
+        info!(
+            "500 allocations: {} tsc (avg: {} tsc per allocation)",
+            end6 - start6,
+            (end6 - start6) as f64 / 100.0
+        );
         Ok(())
-    }).expect("Bulk allocation failed");
+    })
+    .expect("Bulk allocation failed");
 
     // Measure large allocation
     pool.transaction(|tx| {
         let start4 = unsafe { _rdtsc() };
-        tx.allocate_with_id("large", LargeObject {
-            id: 1,
-            data: [0; 4096]
-        })?;
+        tx.allocate_with_id(
+            "large",
+            LargeObject {
+                id: 1,
+                data: [0; 4096],
+            },
+        )?;
         let end4 = unsafe { _rdtsc() };
         info!("4KB allocation: {} tsc", end4 - start4);
         Ok(())
-    }).expect("Large allocation failed");
+    })
+    .expect("Large allocation failed");
 
     //Compare with KernelAlloc
     let start7 = unsafe { _rdtsc() };
@@ -1065,24 +1084,33 @@ fn measure_performance_time(allocator: &mut GlobalPersistentAllocator) {
         let _ = Box::new(i as u64);
     }
     let end8 = unsafe { _rdtsc() };
-    info!("KernelAlloc 100 allocations: {} tsc (avg: {} tsc per allocation)",
-        end8 - start8, (end8 - start8) as f64 / 100.0);
+    info!(
+        "KernelAlloc 100 allocations: {} tsc (avg: {} tsc per allocation)",
+        end8 - start8,
+        (end8 - start8) as f64 / 100.0
+    );
 
     let start9 = unsafe { _rdtsc() };
     for i in 0..200 {
         let _ = Box::new(i as u64);
     }
     let end9 = unsafe { _rdtsc() };
-    info!("KernelAlloc 200 allocations: {} tsc (avg: {} tsc per allocation)",
-        end9 - start9, (end9 - start9) as f64 / 100.0);
+    info!(
+        "KernelAlloc 200 allocations: {} tsc (avg: {} tsc per allocation)",
+        end9 - start9,
+        (end9 - start9) as f64 / 100.0
+    );
 
     let start10 = unsafe { _rdtsc() };
     for i in 0..500 {
         let _ = Box::new(i as u64);
     }
     let end10 = unsafe { _rdtsc() };
-    info!("KernelAlloc 500 allocations: {} tsc (avg: {} tsc per allocation)",
-        end10 - start10, (end10 - start10) as f64 / 100.0);
+    info!(
+        "KernelAlloc 500 allocations: {} tsc (avg: {} tsc per allocation)",
+        end10 - start10,
+        (end10 - start10) as f64 / 100.0
+    );
 
     let start11 = unsafe { _rdtsc() };
     let _ = Box::new([0u8; 4096]);
@@ -1097,82 +1125,120 @@ fn messure_deallocations(allocator: &mut GlobalPersistentAllocator) {
     // 1. Basic Operations
     info!("8byte deallocation");
     pool.transaction(|tx| {
-        tx.allocate_with_id("small1", SmallObject { id: 1, active: true })?;
+        tx.allocate_with_id(
+            "small1",
+            SmallObject {
+                id: 1,
+                active: true,
+            },
+        )?;
         let start1 = unsafe { _rdtsc() };
         tx.deallocate_by_id("small1")?;
         let end1 = unsafe { _rdtsc() };
         info!("8byte deallocation: {} tsc", end1 - start1);
         Ok(())
-    }).expect("Deallocation failed");
+    })
+    .expect("Deallocation failed");
 
     info!("4KB deallocation");
     pool.transaction(|tx| {
-
-        tx.allocate_with_id("large1", LargeObject { id: 1, data: [1; 4096] })?;
+        tx.allocate_with_id(
+            "large1",
+            LargeObject {
+                id: 1,
+                data: [1; 4096],
+            },
+        )?;
         let start2 = unsafe { _rdtsc() };
         tx.deallocate_by_id("large1")?;
         let end2 = unsafe { _rdtsc() };
         info!("4KB deallocation: {} tsc", end2 - start2);
         Ok(())
-    }).expect("Deallocation failed");
+    })
+    .expect("Deallocation failed");
 
     info!("100 8byte deallocations");
     pool.transaction(|tx| {
         for i in 0..100 {
-            tx.allocate_with_id(&format!("small{}", i), SmallObject { id: i as u32, active: true })?;
+            tx.allocate_with_id(
+                &format!("small{}", i),
+                SmallObject {
+                    id: i as u32,
+                    active: true,
+                },
+            )?;
         }
         let start3 = unsafe { _rdtsc() };
         for i in 0..100 {
             tx.deallocate_by_id(&format!("small{}", i))?;
         }
         let end3 = unsafe { _rdtsc() };
-        info!("100 8byte deallocations: {} tsc (avg: {} tsc per deallocation)",
-            end3 - start3, (end3 - start3) as f64 / 100.0
+        info!(
+            "100 8byte deallocations: {} tsc (avg: {} tsc per deallocation)",
+            end3 - start3,
+            (end3 - start3) as f64 / 100.0
         );
         Ok(())
-    }).expect("Deallocation failed");
+    })
+    .expect("Deallocation failed");
 
     info!("200 8byte deallocations");
     pool.transaction(|tx| {
         for i in 0..200 {
-            tx.allocate_with_id(&format!("small{}", i), SmallObject { id: i as u32, active: true })?;
+            tx.allocate_with_id(
+                &format!("small{}", i),
+                SmallObject {
+                    id: i as u32,
+                    active: true,
+                },
+            )?;
         }
         let start4 = unsafe { _rdtsc() };
         for i in 0..200 {
             tx.deallocate_by_id(&format!("small{}", i))?;
         }
         let end4 = unsafe { _rdtsc() };
-        info!("200 8byte deallocations: {} tsc (avg: {} tsc per deallocation)",
-            end4 - start4, (end4 - start4) as f64 / 200.0
+        info!(
+            "200 8byte deallocations: {} tsc (avg: {} tsc per deallocation)",
+            end4 - start4,
+            (end4 - start4) as f64 / 200.0
         );
         Ok(())
-    }).expect("Deallocation failed");
+    })
+    .expect("Deallocation failed");
 
     info!("500 8byte deallocations");
     pool.transaction(|tx| {
         for i in 0..500 {
-            tx.allocate_with_id(&format!("small{}", i), SmallObject { id: i as u32, active: true })?;
+            tx.allocate_with_id(
+                &format!("small{}", i),
+                SmallObject {
+                    id: i as u32,
+                    active: true,
+                },
+            )?;
         }
         let start5 = unsafe { _rdtsc() };
         for i in 0..500 {
             tx.deallocate_by_id(&format!("small{}", i))?;
         }
         let end5 = unsafe { _rdtsc() };
-        info!("500 8byte deallocations: {} tsc (avg: {} tsc per deallocation)",
-            end5 - start5, (end5 - start5) as f64 / 500.0
+        info!(
+            "500 8byte deallocations: {} tsc (avg: {} tsc per deallocation)",
+            end5 - start5,
+            (end5 - start5) as f64 / 500.0
         );
         Ok(())
-    }).expect("Deallocation failed");
+    })
+    .expect("Deallocation failed");
 
     info!("Now for Kernelheap");
-
 
     let test1 = Box::new(1u64);
     let start6 = unsafe { _rdtsc() };
     drop(test1);
     let end6 = unsafe { _rdtsc() };
     info!("KernelAlloc 8bytes: {} tsc", end6 - start6);
-
 
     let test2 = Box::new([0u8; 4096]);
     let kb64start = unsafe { _rdtsc() };
@@ -1186,8 +1252,11 @@ fn messure_deallocations(allocator: &mut GlobalPersistentAllocator) {
         let start = unsafe { _rdtsc() };
         drop(boxes);
         let end = unsafe { _rdtsc() };
-        info!("KernelDealloc 100 deallocations: {} tsc (avg: {} tsc per deallocation)",
-        end - start, (end - start) as f64 / 100.0);
+        info!(
+            "KernelDealloc 100 deallocations: {} tsc (avg: {} tsc per deallocation)",
+            end - start,
+            (end - start) as f64 / 100.0
+        );
     }
 
     // Test 200 deallocations
@@ -1196,8 +1265,11 @@ fn messure_deallocations(allocator: &mut GlobalPersistentAllocator) {
         let start = unsafe { _rdtsc() };
         drop(boxes);
         let end = unsafe { _rdtsc() };
-        info!("KernelDealloc 200 deallocations: {} tsc (avg: {} tsc per deallocation)",
-        end - start, (end - start) as f64 / 200.0);
+        info!(
+            "KernelDealloc 200 deallocations: {} tsc (avg: {} tsc per deallocation)",
+            end - start,
+            (end - start) as f64 / 200.0
+        );
     }
 
     // Test 500 deallocations
@@ -1206,10 +1278,12 @@ fn messure_deallocations(allocator: &mut GlobalPersistentAllocator) {
         let start = unsafe { _rdtsc() };
         drop(boxes);
         let end = unsafe { _rdtsc() };
-        info!("KernelDealloc 500 deallocations: {} tsc (avg: {} tsc per deallocation)",
-        end - start, (end - start) as f64 / 500.0);
+        info!(
+            "KernelDealloc 500 deallocations: {} tsc (avg: {} tsc per deallocation)",
+            end - start,
+            (end - start) as f64 / 500.0
+        );
     }
-
 }
 
 fn test_fragmentation_allocation_overhead(allocator: &mut GlobalPersistentAllocator) {
@@ -1238,7 +1312,6 @@ fn test_fragmentation_allocation_overhead(allocator: &mut GlobalPersistentAlloca
         data: [u8; 64 * 1000], // 64KB
     }
 
-
     // 1. Create initial fragmented state
     info!("Step 1: Creating initial fragmented state");
     // Calculate overhead
@@ -1254,16 +1327,53 @@ fn test_fragmentation_allocation_overhead(allocator: &mut GlobalPersistentAlloca
     pool.transaction(|tx| {
         // Allocate in pattern: Large, Small, Large, Medium, Large, Small
         let start = unsafe { _rdtsc() };
-        tx.allocate_with_id("large_1", LargeBlock { id: 1, data: [1; 64 * 1000] })?;
-        tx.allocate_with_id("small_1", SmallBlock { id: 2, data: [2; 16 * 1000] })?;
-        tx.allocate_with_id("large_2", LargeBlock { id: 3, data: [3; 64 * 1000] })?;
-        tx.allocate_with_id("medium_1", MediumBlock { id: 4, data: [4; 32 * 1000] })?;
-        tx.allocate_with_id("large_3", LargeBlock { id: 5, data: [5; 64 * 1000] })?;
-        tx.allocate_with_id("small_2", SmallBlock { id: 6, data: [6; 16 * 1000] })?;
+        tx.allocate_with_id(
+            "large_1",
+            LargeBlock {
+                id: 1,
+                data: [1; 64 * 1000],
+            },
+        )?;
+        tx.allocate_with_id(
+            "small_1",
+            SmallBlock {
+                id: 2,
+                data: [2; 16 * 1000],
+            },
+        )?;
+        tx.allocate_with_id(
+            "large_2",
+            LargeBlock {
+                id: 3,
+                data: [3; 64 * 1000],
+            },
+        )?;
+        tx.allocate_with_id(
+            "medium_1",
+            MediumBlock {
+                id: 4,
+                data: [4; 32 * 1000],
+            },
+        )?;
+        tx.allocate_with_id(
+            "large_3",
+            LargeBlock {
+                id: 5,
+                data: [5; 64 * 1000],
+            },
+        )?;
+        tx.allocate_with_id(
+            "small_2",
+            SmallBlock {
+                id: 6,
+                data: [6; 16 * 1000],
+            },
+        )?;
         let end = unsafe { _rdtsc() };
         info!("Time to create initial state: {} tsc", end - start);
         Ok(())
-    }).expect("Initial allocation failed");
+    })
+    .expect("Initial allocation failed");
 
     info!("Initial state created");
 
@@ -1273,16 +1383,19 @@ fn test_fragmentation_allocation_overhead(allocator: &mut GlobalPersistentAlloca
     pool.transaction(|tx| {
         // Delete some blocks to create fragmented free space
         let start = unsafe { _rdtsc() };
-        tx.deallocate_by_id("small_1")?;  // Creates 16KB hole
+        tx.deallocate_by_id("small_1")?; // Creates 16KB hole
         tx.deallocate_by_id("medium_1")?; // Creates 32KB hole
-        tx.deallocate_by_id("small_2")?;  // Creates 16KB hole
+        tx.deallocate_by_id("small_2")?; // Creates 16KB hole
         let end = unsafe { _rdtsc() };
-        info!("Time to create 64 kb(16 , 32, 16) fragmentation: {} tsc", end - start);
+        info!(
+            "Time to create 64 kb(16 , 32, 16) fragmentation: {} tsc",
+            end - start
+        );
         Ok(())
-    }).expect("Deallocation failed");
+    })
+    .expect("Deallocation failed");
 
-
-   // pool.debug_print_object_table();
+    // pool.debug_print_object_table();
     info!("Fragmentation created");
 
     // 3. Try to allocate a block that won't fit in first free space
@@ -1292,12 +1405,16 @@ fn test_fragmentation_allocation_overhead(allocator: &mut GlobalPersistentAlloca
         let start = unsafe { _rdtsc() };
         tx.allocate_with_id(
             "medium_new",
-            MediumBlock { id: 7, data: [7; 32 * 1000] }
+            MediumBlock {
+                id: 7,
+                data: [7; 32 * 1000],
+            },
         )?;
         let end = unsafe { _rdtsc() };
         info!("Time to allocate with fragmentation: {} tsc", end - start);
         Ok(())
-    }).expect("New allocation failed");
+    })
+    .expect("New allocation failed");
 
     info!("Final state after allocation");
 
@@ -1305,19 +1422,21 @@ fn test_fragmentation_allocation_overhead(allocator: &mut GlobalPersistentAlloca
     info!("Step 4: Comparing with allocation in clean pool");
     let clean_pool = allocator.get_or_create_pool(b"CLEAN_POOL").unwrap();
 
-    clean_pool.transaction(|tx| {
-        let start = unsafe { _rdtsc() };
-        tx.allocate_with_id(
-            "medium_clean",
-            MediumBlock { id: 8, data: [8; 32 * 1000] }
-        )?;
-        let end = unsafe { _rdtsc() };
-        info!("Time to allocate in clean pool: {} tsc", end - start);
-        Ok(())
-    }).expect("Clean allocation failed");
-
-
-
+    clean_pool
+        .transaction(|tx| {
+            let start = unsafe { _rdtsc() };
+            tx.allocate_with_id(
+                "medium_clean",
+                MediumBlock {
+                    id: 8,
+                    data: [8; 32 * 1000],
+                },
+            )?;
+            let end = unsafe { _rdtsc() };
+            info!("Time to allocate in clean pool: {} tsc", end - start);
+            Ok(())
+        })
+        .expect("Clean allocation failed");
 }
 
 //FOR ME ONLY
@@ -1327,18 +1446,16 @@ fn test_full_usage_allocator(allocator: &mut GlobalPersistentAllocator) {
     let mut i = 1;
     loop {
         match allocator.get_or_create_pool(format!("POOL{i}").as_bytes()) {
-            Ok(_) => i+=1,
-            Err(e) => {
-                match e {
-                    AllocError::NoPoolsAvailable => {
-                        info!("No more pools available");
-                        break;
-                    },
-                    _ => {
-                        panic!("Error: {:?}", e);
-                    }
+            Ok(_) => i += 1,
+            Err(e) => match e {
+                AllocError::NoPoolsAvailable => {
+                    info!("No more pools available");
+                    break;
                 }
-            }
+                _ => {
+                    panic!("Error: {:?}", e);
+                }
+            },
         }
     }
 }
@@ -1361,18 +1478,25 @@ fn test_pool_limits(allocator: &mut GlobalPersistentAllocator) {
             for i in 0..1024 {
                 tx.allocate_with_id(
                     &format!("small_{}", i),
-                    SmallObject { id: i as u32, active: true }
+                    SmallObject {
+                        id: i as u32,
+                        active: true,
+                    },
                 )?;
             }
             info!("Successfully allocated 1024 objects");
             Ok(())
-        }).expect("Failed to allocate 1024 objects");
+        })
+        .expect("Failed to allocate 1024 objects");
 
         // Try to allocate one more object (should fail)
         match pool.transaction(|tx| {
             tx.allocate_with_id(
                 "one_too_many",
-                SmallObject { id: 1025, active: true }
+                SmallObject {
+                    id: 1025,
+                    active: true,
+                },
             )?;
             Ok(())
         }) {
@@ -1389,8 +1513,10 @@ fn test_pool_limits(allocator: &mut GlobalPersistentAllocator) {
         info!("Pool created successfully");
         //pool.debug_print_object_table();
 
-
-        info!("HugeObject size: {} bytes", core::mem::size_of::<HugeObject>());
+        info!(
+            "HugeObject size: {} bytes",
+            core::mem::size_of::<HugeObject>()
+        );
 
         // We need about 64 objects to reach ~4MB (64 * 64KB = 4MB)
         // Let's allocate them in chunks to test different scenarios
@@ -1401,7 +1527,10 @@ fn test_pool_limits(allocator: &mut GlobalPersistentAllocator) {
             for i in 0..16 {
                 tx.allocate_with_id(
                     &format!("huge_{}", i),
-                    HugeObject { id: i as u64, data: [i as u8; 1000 * 64] }
+                    HugeObject {
+                        id: i as u64,
+                        data: [i as u8; 1000 * 64],
+                    },
                 )?;
             }
             info!("First chunk allocated successfully");
@@ -1417,7 +1546,10 @@ fn test_pool_limits(allocator: &mut GlobalPersistentAllocator) {
             for i in 16..32 {
                 tx.allocate_with_id(
                     &format!("huge_{}", i),
-                    HugeObject { id: i as u64, data: [i as u8; 1000 * 64] }
+                    HugeObject {
+                        id: i as u64,
+                        data: [i as u8; 1000 * 64],
+                    },
                 )?;
             }
             info!("Second chunk allocated successfully");
@@ -1433,7 +1565,10 @@ fn test_pool_limits(allocator: &mut GlobalPersistentAllocator) {
             for i in 32..48 {
                 tx.allocate_with_id(
                     &format!("huge_{}", i),
-                    HugeObject { id: i as u64, data: [i as u8; 1000 * 64] }
+                    HugeObject {
+                        id: i as u64,
+                        data: [i as u8; 1000 * 64],
+                    },
                 )?;
             }
             info!("Third chunk allocated successfully");
@@ -1449,7 +1584,10 @@ fn test_pool_limits(allocator: &mut GlobalPersistentAllocator) {
             for i in 48..64 {
                 tx.allocate_with_id(
                     &format!("huge_{}", i),
-                    HugeObject { id: i as u64, data: [i as u8; 1000 * 64] }
+                    HugeObject {
+                        id: i as u64,
+                        data: [i as u8; 1000 * 64],
+                    },
                 )?;
             }
             info!("Fourth chunk allocated successfully");
@@ -1471,10 +1609,13 @@ fn test_pool_limits(allocator: &mut GlobalPersistentAllocator) {
         match pool.transaction(|tx| {
             info!("Allocating rest of the memory...");
 
-                tx.allocate_with_id(
-                    &format!("huge_65"),
-                    SpecialObject { id: 10 as u64, data: [1 as u8; 32127] }
-                )?;
+            tx.allocate_with_id(
+                &format!("huge_65"),
+                SpecialObject {
+                    id: 10 as u64,
+                    data: [1 as u8; 32127],
+                },
+            )?;
 
             info!("Rest of the memory allocated successfully");
             Ok(())
@@ -1482,7 +1623,6 @@ fn test_pool_limits(allocator: &mut GlobalPersistentAllocator) {
             Ok(_) => info!("Rest of the memory allocation completed successfully"),
             Err(e) => panic!("Rest of the memory allocation failed: {:?}", e),
         }
-
 
         // Verify all allocations
         match pool.transaction(|tx| {
@@ -1492,7 +1632,7 @@ fn test_pool_limits(allocator: &mut GlobalPersistentAllocator) {
                     Ok(obj) => {
                         assert_eq!(obj.id, i as u64, "Object ID mismatch for huge_{}", i);
                         assert_eq!(obj.data[0], i as u8, "Data mismatch for huge_{}", i);
-                    },
+                    }
                     Err(e) => panic!("Failed to verify object huge_{}: {:?}", i, e),
                 }
             }
@@ -1508,7 +1648,10 @@ fn test_pool_limits(allocator: &mut GlobalPersistentAllocator) {
             info!("Attempting to allocate beyond limit...");
             tx.allocate_with_id(
                 "huge_overflow",
-                HugeObject { id: 64, data: [64; 1000 * 64] }
+                HugeObject {
+                    id: 64,
+                    data: [64; 1000 * 64],
+                },
             )?;
             Ok(())
         }) {
@@ -1522,7 +1665,6 @@ fn test_pool_limits(allocator: &mut GlobalPersistentAllocator) {
     }
 }
 
-
 fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
     info!("=== Testing Crash Recovery ===");
     let pool = allocator.get_or_create_pool(b"RECOVERY_TEST").unwrap();
@@ -1530,10 +1672,17 @@ fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
     // 1. Test recovery after allocation crash
     info!("Test 1: Recovery after allocation crash");
     pool.transaction(|tx| {
-        tx.allocate_with_id("recover1", SmallObject { id: 1, active: true })?;
+        tx.allocate_with_id(
+            "recover1",
+            SmallObject {
+                id: 1,
+                active: true,
+            },
+        )?;
         // Simulate crash by returning error
         Err::<(), PoolError>(PoolError::TransactionFailed)
-    }).expect_err("Transaction should fail");
+    })
+    .expect_err("Transaction should fail");
 
     // Verify recovery
     pool.transaction(|tx| {
@@ -1543,15 +1692,22 @@ fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
             Err(e) => panic!("Unexpected error: {:?}", e),
         }
         Ok(())
-    }).expect("Recovery verification failed");
-
+    })
+    .expect("Recovery verification failed");
 
     //2. Test recovery after modification crash
     info!("Test 2: Recovery after modification crash");
     pool.transaction(|tx| {
-        tx.allocate_with_id("recover2", SmallObject { id: 2, active: false })?;
+        tx.allocate_with_id(
+            "recover2",
+            SmallObject {
+                id: 2,
+                active: false,
+            },
+        )?;
         Ok(())
-    }).expect("Initial allocation failed");
+    })
+    .expect("Initial allocation failed");
 
     pool.transaction(|tx| {
         let ptr = tx.get_by_id::<SmallObject>("recover2")?;
@@ -1559,39 +1715,47 @@ fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
         // Simulate crash during modification
         //qemu_exit(123);
         Err::<(), PoolError>(PoolError::TransactionFailed)
-    }).expect_err("Transaction should fail");
+    })
+    .expect_err("Transaction should fail");
 
     info!("Verify recovery");
-
 
     //Verify recovery
     pool.transaction(|tx| {
         let obj = tx.read_by_id::<SmallObject>("recover2")?;
-        assert!(!obj.active, "Recovery failed - modification persisted after rollback");
+        assert!(
+            !obj.active,
+            "Recovery failed - modification persisted after rollback"
+        );
         info!("obj status: {}", obj.active);
         info!("Recovery successful - modification properly rolled back");
         Ok(())
-    }).expect("Recovery verification failed");
+    })
+    .expect("Recovery verification failed");
 
     //pool.debug_print_object_table();
-
 
     // 3. Test recovery after deallocation crash
     info!("Test 3: Recovery after deallocation crash");
     pool.transaction(|tx| {
-        tx.allocate_with_id("recover3", MediumObject {
-            id: 3,
-            name: *b"TestObject\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
-            data: [0; 256],
-        })?;
+        tx.allocate_with_id(
+            "recover3",
+            MediumObject {
+                id: 3,
+                name: *b"TestObject\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+                data: [0; 256],
+            },
+        )?;
         Ok(())
-    }).expect("Initial allocation failed");
+    })
+    .expect("Initial allocation failed");
 
     pool.transaction(|tx| {
         tx.deallocate_by_id("recover3")?;
         // Simulate crash during deallocation
         Err::<(), PoolError>(PoolError::TransactionFailed)
-    }).expect_err("Transaction should fail");
+    })
+    .expect_err("Transaction should fail");
 
     // Verify recovery
     pool.transaction(|tx| {
@@ -1600,7 +1764,8 @@ fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
             Err(e) => info!("Recovery failed - object not found after rollback: {:?}", e),
         }
         Ok(())
-    }).expect("Recovery verification failed");
+    })
+    .expect("Recovery verification failed");
 
     //pool.debug_print_object_table();
 
@@ -1608,43 +1773,60 @@ fn test_crash_recovery(allocator: &mut GlobalPersistentAllocator) {
     info!("Test 4: Recovery of multiple operations");
     pool.transaction(|tx| {
         // Multiple operations in one transaction
-        tx.allocate_with_id("multi1", SmallObject { id: 4, active: true })?;
-        let ptr = tx.allocate_with_id("multi2", SmallObject { id: 5, active: false })?;
+        tx.allocate_with_id(
+            "multi1",
+            SmallObject {
+                id: 4,
+                active: true,
+            },
+        )?;
+        let ptr = tx.allocate_with_id(
+            "multi2",
+            SmallObject {
+                id: 5,
+                active: false,
+            },
+        )?;
         tx.modify(ptr, |obj| obj.active = true)?;
         tx.deallocate_by_id("multi1")?;
         // Simulate crash
 
-
         Err::<(), PoolError>(PoolError::TransactionFailed)
-    }).expect_err("Transaction should fail");
+    })
+    .expect_err("Transaction should fail");
 
     //pool.debug_print_object_table();
     //pool.debug_log_pool_state();
 
     // Verify complete rollback
     pool.transaction(|tx| {
-        assert!(tx.get_by_id::<SmallObject>("multi1").is_err(),
-                "Recovery failed - multi1 exists");
-        assert!(tx.get_by_id::<SmallObject>("multi2").is_err(),
-                "Recovery failed - multi2 exists");
+        assert!(
+            tx.get_by_id::<SmallObject>("multi1").is_err(),
+            "Recovery failed - multi1 exists"
+        );
+        assert!(
+            tx.get_by_id::<SmallObject>("multi2").is_err(),
+            "Recovery failed - multi2 exists"
+        );
         info!("Recovery successful - all operations properly rolled back");
         Ok(())
-    }).expect("Recovery verification failed");
+    })
+    .expect("Recovery verification failed");
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct ListNode {
     value: u64,
-    next_offset: u64,  // Offset from pool base, 0 means no next node
-    prev_offset: u64,  // Offset from pool base, 0 means no prev node
+    next_offset: u64, // Offset from pool base, 0 means no next node
+    prev_offset: u64, // Offset from pool base, 0 means no prev node
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct LinkedList {
-    head_offset: u64,  // Offset from pool base to first node
-    tail_offset: u64,  // Offset from pool base to last node
+    head_offset: u64, // Offset from pool base to first node
+    tail_offset: u64, // Offset from pool base to last node
     size: usize,
 }
 
@@ -1669,7 +1851,8 @@ fn test_linked_list(allocator: &mut GlobalPersistentAllocator) {
         tx.allocate_with_id("list", list)?;
         info!("List initialized");
         Ok(())
-    }).expect("Failed to initialize list");
+    })
+    .expect("Failed to initialize list");
 
     // // 2. Add nodes
     let start1 = unsafe { _rdtsc() };
@@ -1692,7 +1875,7 @@ fn test_linked_list(allocator: &mut GlobalPersistentAllocator) {
                 list.head_offset = node_offset;
             } else {
                 // Update previous tail's next pointer
-                let tail_ptr = tx.get_by_id::<ListNode>(&format!("node_{}", i-1))?;
+                let tail_ptr = tx.get_by_id::<ListNode>(&format!("node_{}", i - 1))?;
                 tx.modify(tail_ptr, |node| node.next_offset = node_offset)?;
             }
 
@@ -1705,11 +1888,11 @@ fn test_linked_list(allocator: &mut GlobalPersistentAllocator) {
 
             info!("Added node {} to list", i);
             Ok(())
-        }).expect("Failed to add node");
+        })
+        .expect("Failed to add node");
     }
     let end1 = unsafe { _rdtsc() };
     info!("Adding 5 nodes: {} tsc", end1 - start1);
-
 
     // 4. Print list (after recovery)
     pool.transaction(|tx| {
@@ -1721,9 +1904,14 @@ fn test_linked_list(allocator: &mut GlobalPersistentAllocator) {
             let mut node_found = false;
             for i in 1..=list.size {
                 if let Ok(node) = tx.read_by_id::<ListNode>(&format!("node_{}", i)) {
-                    if (tx.get_by_id::<ListNode>(&format!("node_{}", i))?.as_ptr() as u64) - base_address == current_offset {
-                        info!("Node {}: value={}, next={:#x}, prev={:#x}",
-                            i, node.value, node.next_offset, node.prev_offset);
+                    if (tx.get_by_id::<ListNode>(&format!("node_{}", i))?.as_ptr() as u64)
+                        - base_address
+                        == current_offset
+                    {
+                        info!(
+                            "Node {}: value={}, next={:#x}, prev={:#x}",
+                            i, node.value, node.next_offset, node.prev_offset
+                        );
                         current_offset = node.next_offset;
                         node_found = true;
                         break;
@@ -1735,7 +1923,8 @@ fn test_linked_list(allocator: &mut GlobalPersistentAllocator) {
             }
         }
         Ok(())
-    }).expect("Failed to print list");
+    })
+    .expect("Failed to print list");
 }
 
 // Additional test cases:
@@ -1747,11 +1936,16 @@ fn test_list_modifications(allocator: &mut GlobalPersistentAllocator) {
         let list = LinkedList::new();
         tx.allocate_with_id("mod_list", list)?;
         Ok(())
-    }).expect("Failed to create list");
+    })
+    .expect("Failed to create list");
 
     // 2. Test node modification with crash
     pool.transaction(|tx| {
-        let node = ListNode { value: 42, next_offset: 0, prev_offset: 0 };
+        let node = ListNode {
+            value: 42,
+            next_offset: 0,
+            prev_offset: 0,
+        };
         tx.allocate_with_id("test_node", node)?;
 
         // Modify and crash
@@ -1759,7 +1953,8 @@ fn test_list_modifications(allocator: &mut GlobalPersistentAllocator) {
         tx.modify(ptr, |n| n.value = 100)?;
         //qemu_exit(124);
         Ok(())
-    }).ok();
+    })
+    .ok();
 
     // 3. Verify recovery
     pool.transaction(|tx| {
@@ -1767,7 +1962,8 @@ fn test_list_modifications(allocator: &mut GlobalPersistentAllocator) {
             info!("Node value after recovery: {}", node.value);
         }
         Ok(())
-    }).expect("Failed to verify recovery");
+    })
+    .expect("Failed to verify recovery");
 }
 
 fn test_list_stress(allocator: &mut GlobalPersistentAllocator) {
@@ -1783,20 +1979,21 @@ fn test_list_stress(allocator: &mut GlobalPersistentAllocator) {
             };
             tx.allocate_with_id(&format!("stress_node_{}", i), node)?;
             Ok(())
-        }).expect("Failed stress test allocation");
+        })
+        .expect("Failed stress test allocation");
     }
 
     // Modify nodes randomly
     for _ in 0..50 {
-
-        let idx = unsafe {_rdtsc() % 100};
+        let idx = unsafe { _rdtsc() % 100 };
 
         pool.transaction(|tx| {
             if let Ok(ptr) = tx.get_by_id::<ListNode>(&format!("stress_node_{}", idx)) {
                 tx.modify(ptr, |n| n.value += 1000)?;
             }
             Ok(())
-        }).expect("Failed stress test modification");
+        })
+        .expect("Failed stress test modification");
     }
 }
 
@@ -1811,11 +2008,18 @@ fn test_stress(allocator: &mut GlobalPersistentAllocator) {
         //let start1 = unsafe { _rdtsc() };
         pool.transaction(|tx| {
             for i in 0..512 {
-                tx.allocate_with_id(&format!("alloc{}", i), SmallObject { id: i, active: true })?;
+                tx.allocate_with_id(
+                    &format!("alloc{}", i),
+                    SmallObject {
+                        id: i,
+                        active: true,
+                    },
+                )?;
                 tx.deallocate_by_id(&format!("alloc{}", i))?;
             }
             Ok(())
-        }).expect("Allocation deallocation test failed");
+        })
+        .expect("Allocation deallocation test failed");
         let end1 = unsafe { _rdtsc() };
         //info!("{}. Alloc Delloc 512 times: {} tsc", i,end1 - start1);
     }
