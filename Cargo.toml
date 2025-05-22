@@ -9,6 +9,9 @@ members = [
     "os/application/uptime",
     "os/application/date",
     "os/application/mkdir",
+    "os/application/ls",
+    "os/application/heaptest",
+    "os/application/ntest"
 ]
 
 # [profile.release]
