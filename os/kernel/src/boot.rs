@@ -12,18 +12,19 @@ use crate::device::pit::Timer;
 use crate::device::ps2::Keyboard;
 use crate::device::qemu_cfg;
 use crate::device::serial::SerialPort;
+use crate::init_cpu_info;
+use crate::init_persistent_allocator;
 use crate::interrupt::interrupt_dispatcher;
+use crate::memory::global_persistent_allocator::GlobalPersistentAllocator;
 use crate::memory::nvmem::Nfit;
 use crate::memory::pages::page_table_index;
 use crate::memory::vmm::{VirtualMemoryArea, VmaType};
 use crate::memory::{MemorySpace, PAGE_SIZE, nvmem};
 use crate::network::rtl8139;
-use crate::{naming, efi_services_available, init_persistent_allocator};
-use crate::syscall::syscall_dispatcher;
 use crate::process::thread::Thread;
 use crate::syscall::syscall_dispatcher;
 use crate::{
-    acpi_tables, allocator, apic, built_info, gdt, init_cpu_info, init_acpi_tables, init_apic, init_initrd,
+    acpi_tables, allocator, apic, built_info, gdt, init_acpi_tables, init_apic, init_initrd,
     init_pci, init_serial_port, init_terminal, initrd, keyboard, logger, memory, network,
     process_manager, scheduler, serial_port, terminal, timer, tss,
 };
@@ -63,16 +64,6 @@ use x86_64::structures::paging::frame::PhysFrameRange;
 use x86_64::structures::paging::page::PageRange;
 use x86_64::structures::paging::{Page, PageTable, PageTableFlags, PhysFrame};
 use x86_64::{PhysAddr, VirtAddr};
-use crate::{acpi_tables, allocator, apic, built_info, gdt, init_acpi_tables, init_apic, init_initrd, init_pci, init_serial_port, init_terminal, initrd, keyboard, logger, memory, network, process_manager, scheduler, serial_port, terminal, timer, tss};
-use crate::device::pit::Timer;
-use crate::device::ps2::Keyboard;
-use crate::device::qemu_cfg;
-use crate::device::serial::SerialPort;
-use crate::memory::{MemorySpace, nvmem, PAGE_SIZE};
-use crate::memory::global_persistent_allocator::GlobalPersistentAllocator;
-use crate::memory::nvmem::Nfit;
-use crate::memory::r#virtual::page_table_index;
-use crate::network::rtl8139;
 
 // import labels from linker script 'link.ld'
 unsafe extern "C" {
@@ -153,7 +144,10 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
     )
     .unwrap();
     let vma = VirtualMemoryArea::new_with_tag(
-        PageRange { start: fb_start_page, end: fb_end_page },
+        PageRange {
+            start: fb_start_page,
+            end: fb_end_page,
+        },
         VmaType::DeviceMemory,
         "framebuffer",
     );
@@ -324,12 +318,12 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
 
             let nvram_base = range.as_phys_frame_range().start.start_address().as_u64();
             let nvram_size = (range.as_phys_frame_range().end - range.as_phys_frame_range().start)
-                as usize * PAGE_SIZE;
+                as usize
+                * PAGE_SIZE;
 
             let allocator = GlobalPersistentAllocator::new(nvram_base, nvram_size);
             info!("About to store allocator in global storage");
             init_persistent_allocator(allocator);
-
         }
     }
 

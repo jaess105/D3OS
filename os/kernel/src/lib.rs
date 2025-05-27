@@ -31,18 +31,18 @@ use crate::interrupt::interrupt_dispatcher::InterruptDispatcher;
 use crate::log::Logger;
 use crate::memory::PAGE_SIZE;
 use crate::memory::acpi_handler::AcpiHandler;
+use crate::memory::global_persistent_allocator::GlobalPersistentAllocator;
 use crate::memory::kheap::KernelAllocator;
 use crate::process::process_manager::ProcessManager;
 use crate::process::scheduler::Scheduler;
 use crate::process::thread::Thread;
 use crate::syscall::syscall_dispatcher::CoreLocalStorage;
+use ::log::info;
 use ::log::{Level, Log, Record, error};
 use acpi::AcpiTables;
 use alloc::sync::Arc;
 use core::fmt::Arguments;
 use core::panic::PanicInfo;
-use ::log::{error, info, Level, Log, Record};
-use acpi::AcpiTables;
 use multiboot2::ModuleTag;
 use spin::{Mutex, Once, RwLock};
 use tar_no_std::TarArchiveRef;
@@ -52,12 +52,6 @@ use x86_64::structures::idt::InterruptDescriptorTable;
 use x86_64::structures::paging::PhysFrame;
 use x86_64::structures::paging::frame::PhysFrameRange;
 use x86_64::structures::tss::TaskStateSegment;
-use x86_64::PhysAddr;
-use crate::device::pci::PciBus;
-use crate::memory::global_persistent_allocator::GlobalPersistentAllocator;
-use crate::memory::PAGE_SIZE;
-use crate::process::process::ProcessManager;
-use crate::syscall::syscall_dispatcher::CoreLocalStorage;
 
 extern crate alloc;
 
@@ -108,11 +102,8 @@ fn panic(info: &PanicInfo) -> ! {
 /// CPU caps.
 static CPU: Once<Cpu> = Once::new();
 
-
 pub fn init_cpu_info() {
-    CPU.call_once(|| {
-        Cpu::new()
-    });
+    CPU.call_once(|| Cpu::new());
 }
 
 /// Returns a reference to the CPU info struct.
@@ -120,7 +111,6 @@ pub fn cpu() -> &'static Cpu {
     CPU.get()
         .expect("Trying to access CPU info before initialization!")
 }
-
 
 /// Check if EFI system table (and thus runtime services) are available.
 pub fn efi_services_available() -> bool {
@@ -244,7 +234,8 @@ pub fn init_persistent_allocator(allocator: GlobalPersistentAllocator) {
 }
 
 pub fn persistent_allocator() -> &'static RwLock<GlobalPersistentAllocator> {
-    PERSISTENT_ALLOCATOR.get()
+    PERSISTENT_ALLOCATOR
+        .get()
         .expect("Trying to access persistent allocator before initialization!")
 }
 // endregion
