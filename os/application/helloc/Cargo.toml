@@ -1,11 +1,8 @@
-cargo-features = ["edition2024"]
-
 [package]
 edition = "2024"
 name = "helloc"
 version = "0.1.0"
 authors = ["Michael Schöttner <michael.schoettner@hhu.de>, Fabian Ruhland <ruhland@hhu.de>"]
-build = "build.rs"
 
 [lib]
 crate-type = ["staticlib"]
@@ -14,6 +11,3 @@ crate-type = ["staticlib"]
 # Local dependencies
 runtime = { path = "../../library/runtime" }
 libc = { path = "../../library/libc" }
-
-[build-dependencies]
-cc = "1.1.18"

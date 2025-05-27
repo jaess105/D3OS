@@ -7,22 +7,24 @@
    ╚═════════════════════════════════════════════════════════════════════════╝
 */
 
-use crate::memory::r#virtual::{VirtualMemoryArea, VmaType};
-use crate::memory::{MemorySpace, PAGE_SIZE};
+use x86_64::VirtAddr;
+
+use crate::memory::vmm::{VirtualMemoryArea, VmaType};
 use crate::process_manager;
-use x86_64::structures::paging::PageTableFlags;
 
 
-pub fn sys_map_user_heap(size: usize) -> isize {
+/// Map memory to a process.
+/// 
+/// This just sets up the VMA, no page tables are created yet.
+/// This happens later on on page faults.
+pub fn sys_map_memory(start: usize, size: usize) -> isize {
+    let start_addr = VirtAddr::new(start.try_into().unwrap());
     let process = process_manager().read().current_process();
-    let code_areas = process.find_vmas(VmaType::Code);
-    let code_area = code_areas.get(0).expect("Process does not have code area!");
-    let heap_start = code_area.end().align_up(PAGE_SIZE as u64);
-    let heap_area = VirtualMemoryArea::from_address(heap_start, size, VmaType::Heap);
 
-    process.address_space().map(heap_area.range(), MemorySpace::User, PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE);
-    process.add_vma(heap_area);
-
-    heap_start.as_u64() as isize
+    let area = VirtualMemoryArea::from_address(start_addr, size, VmaType::Heap);
+    // insert it into the process, this checks if it's free
+    process.virtual_address_space.add_vma(area);
+    
+    0
 }
 
