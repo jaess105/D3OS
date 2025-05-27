@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::BitOr;
 use core::{ptr, slice};
@@ -22,7 +23,7 @@ use x86_64::{PhysAddr, VirtAddr};
 use crate::{apic, interrupt_dispatcher, pci_bus, process_manager, scheduler};
 use crate::interrupt::interrupt_dispatcher::InterruptVector;
 use crate::interrupt::interrupt_handler::InterruptHandler;
-use crate::memory::{physical, PAGE_SIZE};
+use crate::memory::{frames, PAGE_SIZE};
 
 const BUFFER_SIZE: usize = 8 * 1024 + 16 + 1500;
 const BUFFER_PAGES: usize = if BUFFER_SIZE % PAGE_SIZE == 0 { BUFFER_SIZE / PAGE_SIZE } else { BUFFER_SIZE / PAGE_SIZE + 1 };
@@ -132,7 +133,7 @@ pub struct Rtl8139 {
 }
 
 pub struct Rtl8139InterruptHandler {
-    device: &'static Rtl8139
+    device: Arc<Rtl8139>
 }
 
 impl Registers {
@@ -179,7 +180,7 @@ impl TransmitDescriptor {
 
 impl ReceiveBuffer {
     pub fn new() -> Self {
-        let receive_memory = physical::alloc(BUFFER_PAGES);
+        let receive_memory = frames::alloc(BUFFER_PAGES);
         let receive_buffer = unsafe { Vec::from_raw_parts(receive_memory.start.start_address().as_u64() as *mut u8, BUFFER_SIZE, BUFFER_SIZE) };
 
         Self { index: 0, data: receive_buffer }
@@ -200,32 +201,32 @@ unsafe impl Allocator for PacketAllocator {
         }
 
         let start = PhysFrame::from_start_address(PhysAddr::new(ptr.as_ptr() as u64)).expect("PacketAllocator may only be used with page frames!");
-        unsafe { physical::free(PhysFrameRange { start, end: start + 1 }) }
+        unsafe { frames::free(PhysFrameRange { start, end: start + 1 }) }
     }
 }
 
-pub struct Rtl8139TxToken {
-    device: &'static Rtl8139
+pub struct Rtl8139TxToken<'a> {
+    device: &'a Rtl8139
 }
 
-pub struct Rtl8139RxToken {
+pub struct Rtl8139RxToken<'a> {
     buffer: Vec<u8, PacketAllocator>,
-    device: &'static Rtl8139
+    device: &'a Rtl8139
 }
 
-impl<'a> Rtl8139TxToken {
-    pub fn new(device: &'static Rtl8139) -> Self {
+impl<'a> Rtl8139TxToken<'a> {
+    pub fn new(device: &'a Rtl8139) -> Self {
         Self { device }
     }
 }
 
-impl<'a> Rtl8139RxToken {
-    pub fn new(buffer: Vec<u8, PacketAllocator>, device: &'static Rtl8139) -> Self {
+impl<'a> Rtl8139RxToken<'a> {
+    pub fn new(buffer: Vec<u8, PacketAllocator>, device: &'a Rtl8139) -> Self {
         Self { buffer, device }
     }
 }
 
-impl<'a> phy::TxToken for Rtl8139TxToken {
+impl<'a> phy::TxToken for Rtl8139TxToken<'a> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where F: FnOnce(&mut [u8]) -> R {
         if len > PAGE_SIZE {
@@ -233,7 +234,7 @@ impl<'a> phy::TxToken for Rtl8139TxToken {
         }
 
         // Allocate physical memory for the packet (DMA only works with physical addresses)
-        let phys_buffer = physical::alloc(1);
+        let phys_buffer = frames::alloc(1);
         let phys_start_addr = phys_buffer.start.start_address();
         let pages = PageRange {
             start: Page::from_start_address(VirtAddr::new(phys_start_addr.as_u64())).unwrap(),
@@ -242,7 +243,7 @@ impl<'a> phy::TxToken for Rtl8139TxToken {
 
         // Disable caching for allocated buffer
         let kernel_process = process_manager().read().kernel_process().unwrap();
-        kernel_process.address_space().set_flags(pages, PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE);
+        kernel_process.virtual_address_space.set_flags(pages, PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE);
 
         // Queue physical memory for deallocation after transmission
         self.device.send_queue.1.enqueue(phys_buffer).expect("Failed to enqueue physical buffer!");
@@ -270,9 +271,9 @@ impl<'a> phy::TxToken for Rtl8139TxToken {
     }
 }
 
-impl<'a> phy::RxToken for Rtl8139RxToken {
+impl<'a> phy::RxToken for Rtl8139RxToken<'a> {
     fn consume<R, F>(mut self, f: F) -> R
-    where F: FnOnce(&mut [u8]) -> R {
+    where F: FnOnce(&[u8]) -> R {
         let result = f(&mut self.buffer);
         self.device.recv_buffers_empty.1.try_enqueue(self.buffer).expect("Failed to enqueue used receive buffer!");
 
@@ -281,8 +282,8 @@ impl<'a> phy::RxToken for Rtl8139RxToken {
 }
 
 impl phy::Device for Rtl8139 {
-    type RxToken<'a> = Rtl8139RxToken where Self: 'a;
-    type TxToken<'a> = Rtl8139TxToken where Self: 'a;
+    type RxToken<'a> = Rtl8139RxToken<'a> where Self: 'a;
+    type TxToken<'a> = Rtl8139TxToken<'a> where Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let device = unsafe { ptr::from_ref(self).as_ref()? };
@@ -308,8 +309,8 @@ impl phy::Device for Rtl8139 {
 }
 
 impl Rtl8139InterruptHandler {
-    pub fn new(rtl8139: &'static Rtl8139) -> Self {
-        Self { device: rtl8139 }
+    pub fn new(device: Arc<Rtl8139>) -> Self {
+        Self { device }
     }
 }
 
@@ -319,27 +320,37 @@ impl InterruptHandler for Rtl8139InterruptHandler {
             panic!("Interrupt status register is locked during interrupt!");
         }
 
+        // Read interrupt status register (Each bit corresponds to an interrupt type or error)
         let mut status_reg = self.device.registers.interrupt_status.lock();
         let status = Interrupt::from_bits_retain(unsafe { status_reg.read() });
 
-        if status.contains(Interrupt::TRANSMIT_OK) && !physical::allocator_locked() {
+        // Check error flags
+        if status.contains(Interrupt::TRANSMIT_ERROR) {
+            panic!("Transmit failed!");
+        } else if status.contains(Interrupt::RECEIVE_ERROR) {
+            panic!("Receive failed!");
+        }
+
+        // Writing the status register clears all bits.
+        // According to the RTL8139 documentation, this is not necessary,
+        // but QEMU and some hardware require clearing the interrupt status register.
+        // Furthermore, this needs to be done before processing the received packet (https://wiki.osdev.org/RTL8139).
+        unsafe { status_reg.write(status.bits()); }
+
+        // Handle transmit by freeing allocated buffers
+        if status.contains(Interrupt::TRANSMIT_OK) && !frames::allocator_locked() {
             let mut queue = self.device.send_queue.0.lock();
             let mut buffer = queue.try_dequeue();
             while buffer.is_ok() {
-                unsafe { physical::free(buffer.unwrap()) };
+                unsafe { frames::free(buffer.unwrap()) };
                 buffer = queue.try_dequeue();
             }
         }
 
+        // Handle receive interrupt by processing received packet
         if status.contains(Interrupt::RECEIVE_OK) {
             self.device.process_received_packet();
         }
-
-        if status.contains(Interrupt::TRANSMIT_ERROR) {
-            panic!("Transmit failed!");
-        }
-
-        unsafe { status_reg.write(status.bits()); }
     }
 }
 
@@ -365,13 +376,13 @@ impl Rtl8139 {
         let kernel_process = process_manager().read().kernel_process().unwrap();
         let recv_buffers = mpmc::bounded::scq::queue(RECV_QUEUE_CAP);
         for _ in 0..RECV_QUEUE_CAP {
-            let phys_frame = physical::alloc(1);
+            let phys_frame = frames::alloc(1);
             let pages = PageRange {
                 start: Page::from_start_address(VirtAddr::new(phys_frame.start.start_address().as_u64())).unwrap(),
                 end: Page::from_start_address(VirtAddr::new(phys_frame.end.start_address().as_u64())).unwrap()
             };
 
-            kernel_process.address_space().set_flags(pages, PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE);
+            kernel_process.virtual_address_space.set_flags(pages, PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE);
 
             let buffer = unsafe { Vec::from_raw_parts_in(phys_frame.start.start_address().as_u64() as *mut u8, PAGE_SIZE, PAGE_SIZE, PacketAllocator::default()) };
             recv_buffers.1.try_enqueue(buffer).expect("Failed to enqueue receive buffer!");
@@ -414,10 +425,10 @@ impl Rtl8139 {
         rtl8139
     }
 
-    pub fn plugin(&self) {
-        let device = unsafe { ptr::from_ref(self).as_ref().unwrap() };
-        interrupt_dispatcher().assign(self.interrupt, Box::new(Rtl8139InterruptHandler::new(device)));
-        apic().allow(self.interrupt);
+    pub fn plugin(device: Arc<Rtl8139>) {
+        let interrupt = device.interrupt;
+        interrupt_dispatcher().assign(device.interrupt, Box::new(Rtl8139InterruptHandler::new(device)));
+        apic().allow(interrupt);
     }
 
     pub fn read_mac_address(&self) -> EthernetAddress {

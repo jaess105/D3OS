@@ -3,13 +3,10 @@
    ╟─────────────────────────────────────────────────────────────────────────╢
    ║ Descr.: Syscall interface in user mode.                                 ║
    ╟─────────────────────────────────────────────────────────────────────────╢
-   ║ Author: Fabian Ruhland, Michael Schoettner, 10.09.2024, HHU             ║
+   ║ Author: Fabian Ruhland, Michael Schoettner, 30.12.2024, HHU             ║
    ╚═════════════════════════════════════════════════════════════════════════╝
 */
 #![no_std]
-
-#[macro_use]
-extern crate bitflags;
 
 pub mod return_vals;
 
@@ -22,7 +19,7 @@ use return_vals::{SyscallResult, convert_ret_code_to_syscall_result};
 pub enum SystemCall {
     TerminalRead = 0,
     TerminalWrite,
-    MapUserHeap,
+    MapMemory,
     ProcessExecuteBinary,
     ProcessId,
     ProcessExit,
@@ -35,10 +32,19 @@ pub enum SystemCall {
     GetSystemTime,
     GetDate,
     SetDate,
+    Open,
+    Read,
+    Write,
+    Seek,
+    Close,
     MkDir,
     CreatePersistentPool,
     ReleasePersistentPool,
     PerformTransaction,
+    Touch,
+    Readdir,
+    Cwd,
+    Cd,
     // no syscall, just marking last number, see NUM_SYSCALLS
     // insert any new system calls before this marker
     LastEntryMarker,
@@ -85,5 +91,3 @@ pub fn syscall(call: SystemCall, args: &[usize]) -> SyscallResult {
 
     convert_ret_code_to_syscall_result(ret_code.try_into().unwrap())
 }
-
-

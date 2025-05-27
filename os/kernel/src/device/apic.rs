@@ -16,6 +16,7 @@ use x86_64::structures::paging::{Page, PageTableFlags};
 use crate::{acpi_tables, allocator, interrupt_dispatcher, process_manager, scheduler, timer};
 use crate::interrupt::interrupt_handler::InterruptHandler;
 use crate::memory::MemorySpace;
+use crate::memory::vmm::{VirtualMemoryArea, VmaType};
 
 pub struct Apic {
     local_apic: Mutex<LocalApic>,
@@ -24,6 +25,9 @@ pub struct Apic {
     nmi_sources: Vec<NmiSource>,
     timer_ticks_per_ms: usize
 }
+
+unsafe impl Send for Apic {}
+unsafe impl Sync for Apic {}
 
 #[derive(Default)]
 struct ApicTimerInterruptHandler {}
@@ -53,8 +57,10 @@ impl Apic {
             }
         }
 
+
         // Find APIC relevant structures in ACPI tables
-        let madt = acpi_tables().lock().find_table::<Madt>().expect("MADT not available");
+        let madt_mapping = acpi_tables().lock().find_table::<Madt>().expect("MADT not available");
+		let madt = madt_mapping.get();
         let int_model = madt.parse_interrupt_model_in(allocator()).expect("Interrupt model not found in MADT");
         let cpu_info = int_model.1.expect("CPU info not found in interrupt model");
 
@@ -88,6 +94,13 @@ impl Apic {
                     info!("NMI source [{}], Polarity: [{:?}], Trigger: [{:?}]", nmi_source.global_system_interrupt, nmi_source.polarity, nmi_source.trigger_mode);
                     nmi_sources.push(NmiSource { global_system_interrupt: nmi_source.global_system_interrupt, polarity: nmi_source.polarity, trigger_mode: nmi_source.trigger_mode });
                 }
+
+                info!("[{}] IO {} detected", apic_desc.io_apics.len(), if apic_desc.io_apics.len() == 1 { "APIC" } else { "APICs" });
+
+                // Iterate over IO APIC entries in MADT and initialize IO APICs (should only be a single one on most systems)
+                for (i, io_apic_desc) in apic_desc.io_apics.iter().enumerate() {
+                    info!("Initializing IO APIC [{}]", i);
+                    let mut io_apic = Self::create_io_apic(io_apic_desc);
 
                 info!("[{}] IO {} detected", apic_desc.io_apics.len(), if apic_desc.io_apics.len() == 1 { "APIC" } else { "APICs" });
 
@@ -178,6 +191,55 @@ impl Apic {
     fn create_local_apic(madt: &Madt) -> LocalApic {
         // Read physical APIC MMIO base address and map it to the kernel address space
         let registers = Page::from_start_address(VirtAddr::new(madt.local_apic_address as u64)).expect("Local Apic MMIO address is not page aligned");
+        let vma = VirtualMemoryArea::new_with_tag(
+            PageRange { start: registers, end: registers + 1 },
+            VmaType::DeviceMemory,
+            "lapic",
+        );
+        let process = process_manager().read().kernel_process().unwrap();
+        process.virtual_address_space.add_vma(vma);
+        process.virtual_address_space.map(
+            vma,
+            MemorySpace::Kernel,
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE,
+        );
+        
+        LocalApicBuilder::new()
+            .timer_vector(InterruptVector::ApicTimer as usize)
+            .error_vector(InterruptVector::ApicError as usize)
+            .spurious_vector(InterruptVector::Spurious as usize)
+            .set_xapic_base(registers.start_address().as_u64())
+            .build()
+            .unwrap_or_else(|err| panic!("Failed to initialize Local APIC ({})!", err))
+    }
+
+    fn create_io_apic(io_apic_desc: &acpi::platform::interrupt::IoApic) -> IoApic {
+        // Read physical IO APIC MMIO base address and map it to the kernel address space
+        let registers = Page::from_start_address(VirtAddr::new(io_apic_desc.address as u64)).expect("IO Apic MMIO address is not page aligned");
+        let vma = VirtualMemoryArea::new_with_tag(
+            PageRange { start: registers, end: registers + 1 },
+            VmaType::DeviceMemory,
+            "ioapic",
+        );
+        let process = process_manager().read().kernel_process().unwrap();
+        process.virtual_address_space.add_vma(vma);
+        process.virtual_address_space.map(
+            vma,
+            MemorySpace::Kernel,
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE,
+        );
+        
+        unsafe {
+            let mut io_apic = IoApic::new(registers.start_address().as_u64());
+            io_apic.init(io_apic_desc.global_system_interrupt_base as u8);
+
+            io_apic
+        Self { local_apic, io_apics, irq_overrides, nmi_sources, timer_ticks_per_ms }
+    }
+    
+    fn create_local_apic(madt: &Madt) -> LocalApic {
+        // Read physical APIC MMIO base address and map it to the kernel address space
+        let registers = Page::from_start_address(VirtAddr::new(madt.local_apic_address as u64)).expect("Local Apic MMIO address is not page aligned");
         let address_space = process_manager().read().kernel_process().unwrap().address_space();
         address_space.map(PageRange { start: registers, end: registers + 1 }, MemorySpace::Kernel, PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE);
         
@@ -232,7 +294,7 @@ impl Apic {
         let mut local_apic = self.local_apic.lock();
 
         unsafe {
-            local_apic.set_timer_divide(TimerDivide::Div256); // Div256 is labelled wrong and actually means Div1
+            local_apic.set_timer_divide(TimerDivide::Div1);
             local_apic.set_timer_mode(TimerMode::Periodic);
             local_apic.set_timer_initial((self.timer_ticks_per_ms * interval_ms) as u32);
             local_apic.enable_timer();
@@ -245,7 +307,7 @@ impl Apic {
         unsafe {
             // Set APIC timer to count down from 0xffffffff
             local_apic.disable_timer();
-            local_apic.set_timer_divide(TimerDivide::Div256); // Div256 is labelled wrong and actually means Div1
+            local_apic.set_timer_divide(TimerDivide::Div1);
             local_apic.set_timer_mode(TimerMode::OneShot);
             local_apic.set_timer_initial(0xffffffff);
             local_apic.enable_timer();
