@@ -155,7 +155,11 @@ impl Scheduler {
         };
 
         state.ready_queue.push_front(thread);
-        join_map.insert(id, Vec::new());
+
+        // Don't override value if key present
+        if !join_map.contains_key(&id){
+            join_map.insert(id, Vec::new());
+        }
     }
 
     /// Put calling thread to sleep for `ms` milliseconds
