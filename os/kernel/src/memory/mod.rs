@@ -12,6 +12,8 @@ pub mod heap;
 pub mod stack;
 pub mod acpi_handler;
 
+pub mod nvmem_inconsistent_test;
+
 #[derive(PartialEq)]
 #[derive(Clone, Copy, Debug)]
 pub enum MemorySpace {

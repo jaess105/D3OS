@@ -8,8 +8,8 @@
    ╚═════════════════════════════════════════════════════════════════════════╝
 */
 
-use crate::memory::vma::VmaType;
 use crate::memory::PAGE_SIZE;
+use crate::memory::vma::VmaType;
 use crate::{acpi_tables, process_manager};
 use acpi::AcpiTable;
 use acpi::sdt::{SdtHeader, Signature};
@@ -21,6 +21,8 @@ use log::info;
 use x86_64::PhysAddr;
 use x86_64::structures::paging::frame::PhysFrameRange;
 use x86_64::structures::paging::{PageTableFlags, PhysFrame};
+
+use crate::memory::nvmem_inconsistent_test::{self as nvmemi, NvmiMode};
 
 #[allow(dead_code)]
 #[repr(u16)]
@@ -221,12 +223,11 @@ pub fn init() {
     if let Ok(nfit) = acpi_tables().lock().find_table::<Nfit>() {
         // Search NFIT table for non-volatile memory ranges
         for spa in nfit.get_phys_addr_ranges() {
-
             // Copy values to avoid unaligned access of packed struct fields
             let address = spa.base;
             let length = spa.length;
             info!("Found non-volatile memory (Address: [0x{:x}], Length: [{} MiB])", address, length / 1024 / 1024);
-            
+
             process.virtual_address_space.kernel_map_devm_identity(
                 address,
                 address + length,
@@ -234,6 +235,13 @@ pub fn init() {
                 VmaType::DeviceMemory,
                 "nvram",
             );
+            // process.virtual_address_space.get_phys(virt_addr)
+
+            const OFFSET_DUE_TO_OS_WRITING: u64 = 16;
+            let write_address = (address + OFFSET_DUE_TO_OS_WRITING) as *mut u8;
+            let msg = b"PersistentHello123 More Hello maybe that gets through?";
+            nvmemi::run(NvmiMode::Simple(write_address, msg));
+            // nvmemi::simple_write(, &msg);
         }
     }
 }
