@@ -17,15 +17,15 @@ const PAYLOAD_LEN: usize = 16 * 1024 * 1024; // 16 MiB object (adjust)
 const PAYLOAD_OFFSET: usize = 4096;
 const HEADER_OFFSET: usize = 0;
 
-const CHUNK_SIZE: usize = 4096 * 16; // 64 KiB per chunk
-const DELAY_MS: u64 = 200; // 200 ms between chunks
+pub const CHUNK_SIZE: usize = 4096 * 16; // 64 KiB per chunk
+pub const DELAY_MS: usize = 200; // 200 ms between chunks
 const FLUSH_EACH_CHUNK: bool = false; // toggle flush (msync) per chunk
 
 #[derive(Debug, Clone)]
 pub enum NvmiMode<'a> {
     /// Will run a simple program writing into the nvme mem region `{mem_path}`.
     Simple(*mut u8, &'a [u8]),
-    /// Will write an "object" of size `{payload_len}` into the nvme mem region `{mem_path}` and delay each time for
+    /// Will write an "object" of size `{payload_len}` into the nvme mem region at `{addr}` and delay each time for
     /// `{delay_ms}` milliseconds between `{chunk_size}` many bytes written into memory.
     /// This allows for simulating a crash during writing into memory.
     PMemWrite(*mut u8, usize, usize, usize, bool),

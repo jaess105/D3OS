@@ -239,8 +239,11 @@ pub fn init() {
 
             const OFFSET_DUE_TO_OS_WRITING: u64 = 16;
             let write_address = (address + OFFSET_DUE_TO_OS_WRITING) as *mut u8;
-            let msg = b"PersistentHello123 More Hello maybe that gets through?";
-            nvmemi::run(NvmiMode::Simple(write_address, msg));
+
+            nvmemi::run(
+                // NvmiMode::Simple(write_address, b"PersistentHello123 More Hello maybe that gets through?")
+                NvmiMode::PMemWrite(write_address, (length / 2) as usize, nvmemi::CHUNK_SIZE, nvmemi::DELAY_MS, true),
+            );
             // nvmemi::simple_write(, &msg);
         }
     }
