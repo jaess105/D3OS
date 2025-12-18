@@ -237,14 +237,6 @@ pub fn init() {
             );
             // process.virtual_address_space.get_phys(virt_addr)
 
-            const OFFSET_DUE_TO_OS_WRITING: u64 = 16;
-            let write_address = (address + OFFSET_DUE_TO_OS_WRITING) as *mut u8;
-
-            nvmemi::run(
-                // NvmiMode::Simple(write_address, b"PersistentHello123 More Hello maybe that gets through?")
-                NvmiMode::PMemWrite(write_address, (length / 2) as usize, nvmemi::CHUNK_SIZE, nvmemi::DELAY_MS, true),
-            );
-            // nvmemi::simple_write(, &msg);
         }
     }
 }

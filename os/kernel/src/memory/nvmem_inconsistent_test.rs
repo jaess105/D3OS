@@ -1,8 +1,8 @@
-use core::ptr;
+use core::{ptr, u8};
 
 use alloc::vec::Vec;
 use alloc::{slice, vec};
-use log::info;
+use log::{error, info};
 
 use crate::syscall::sys_concurrent::sys_thread_sleep;
 
@@ -10,16 +10,47 @@ use crate::syscall::sys_concurrent::sys_thread_sleep;
 // [0..8)    magic
 // [8..16)   payload_len (u64 little endian)
 // [16..20)  crc32 (u32 little endian)
-// [4096..]  payload ( payload aligned to start of page boundary)
+// [16..]  payload
 const MAGIC: &[u8; 8] = b"PMEMOBJ1";
-const PAYLOAD_LEN: usize = 16 * 1024 * 1024; // 16 MiB object (adjust)
+const PAYLOAD_LEN: usize = 16 * 1024 * 1024; // 16 MiB object 
 
-const PAYLOAD_OFFSET: usize = 4096;
+const PAYLOAD_OFFSET: usize = size_of::<Meta>();
 const HEADER_OFFSET: usize = 0;
 
 pub const CHUNK_SIZE: usize = 4096 * 16; // 64 KiB per chunk
 pub const DELAY_MS: usize = 200; // 200 ms between chunks
-const FLUSH_EACH_CHUNK: bool = false; // toggle flush (msync) per chunk
+
+#[repr(C)]
+#[derive(Debug)]
+struct Meta {
+    magic: [u8; 8],
+    payload_len: usize,
+    payload_offset: usize,
+}
+
+impl Meta {
+    fn read_meta_at_address(address: usize) -> &'static Self {
+        unsafe { &*(address as *const Meta) }
+    }
+
+    fn write_at_address(address: usize, magic: &[u8; 8], payload_len: usize, payload_offset: usize) {
+        let meta = address as *mut Meta;
+        unsafe {
+            (*meta).magic.copy_from_slice(magic);
+            (*meta).payload_len = payload_len;
+            (*meta).payload_offset = payload_offset;
+        }
+    }
+
+    fn write_meta_at_address(address: usize, data: Meta) {
+        unsafe { ptr::write(address as *mut Meta, data) };
+    }
+
+    fn payload_ptr(&self) -> usize {
+        let addr = (self as *const Meta) as usize;
+        addr + self.payload_offset
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum NvmiMode<'a> {
@@ -28,11 +59,11 @@ pub enum NvmiMode<'a> {
     /// Will write an "object" of size `{payload_len}` into the nvme mem region at `{addr}` and delay each time for
     /// `{delay_ms}` milliseconds between `{chunk_size}` many bytes written into memory.
     /// This allows for simulating a crash during writing into memory.
-    PMemWrite(*mut u8, usize, usize, usize, bool),
+    PMemWrite(usize, usize, usize, usize, bool),
     /// Will check if the memory in the nvme mem region `{mem_path}` is consistent.
     /// This will try to detect, weather a write was interrupted or inconsistent many bytes were written into memory.
     /// This should be run after pmem-write was run and the system was lead to a crash.
-    PMemCheck(*mut u8),
+    PMemCheck(usize, usize),
     /// Does nothing
     Nothing,
 }
@@ -45,11 +76,11 @@ pub fn run(mode: NvmiMode) {
         }
         NvmiMode::PMemWrite(addr, payload_len, chunk_size, delay_ms, flush_each_chunk) => {
             info!("NVMI: Running pmem writer!");
-            pmem_write(addr, payload_len, chunk_size, delay_ms, flush_each_chunk);
+            pmem_write(addr as *mut u8, payload_len, chunk_size, delay_ms, flush_each_chunk);
         }
-        NvmiMode::PMemCheck(addr) => {
+        NvmiMode::PMemCheck(addr, chunk_size) => {
             info!("NVMI: Running pmem checker!");
-            pmem_check(addr);
+            pmem_check(addr, chunk_size);
         }
         NvmiMode::Nothing => {
             info!("NVMI: Running nothing!");
@@ -57,47 +88,31 @@ pub fn run(mode: NvmiMode) {
     }
 }
 
-fn pmem_check(addr: *mut u8) {
+fn pmem_check(addr: usize, chunk_size: usize) {
     unsafe {
-        let header_ptr = addr as *const u8;
-        let magic_present = slice::from_raw_parts(header_ptr, 8);
-        if magic_present != MAGIC {
-            panic!("No object header found (magic mismatch). Device likely zero or unrelated data.");
+        let meta = Meta::read_meta_at_address(addr + HEADER_OFFSET as usize);
+        if &meta.magic != MAGIC {
+            error!("No object header found (magic mismatch). Device likely zero or unrelated data.");
+            return;
         }
 
-        let len_ptr = header_ptr.add(8) as *const u64;
-        let payload_len = u64::from_le(*len_ptr) as usize;
-        let crc_ptr = header_ptr.add(16) as *const u32;
-        let expected_crc = u32::from_le(*crc_ptr);
-        info!(
-            "Found object header. declared payload bytes: {}, expected CRC32: {:08x}",
-            payload_len, expected_crc
-        );
+        info!("Found object header. declared payload bytes: {}", meta.payload_len,);
 
-        let payload_ptr = header_ptr.add(PAYLOAD_OFFSET);
-        let present = check_chunks(payload_ptr, payload_len, CHUNK_SIZE);
+        let payload_ptr = meta.payload_ptr();
+        let consistent_chunks_size = check_chunks(payload_ptr, meta.payload_len, chunk_size);
 
-        info!("Contiguous non-zero bytes from payload start: {}", present);
+        info!("Contiguous non-zero bytes from payload start: {}", consistent_chunks_size);
 
-        // compute crc over the contiguous region present
-        let expected_slice = slice::from_raw_parts(payload_ptr, payload_len);
-        let present_slice = slice::from_raw_parts(addr, payload_len);
-
-        if expected_slice == present_slice {
-            info!("Object is fully present and CRC matches: consistent!");
-        } else if present == 0 {
-            info!("No payload data present (all zeros).");
+        if consistent_chunks_size == meta.payload_len {
+            info!("Object is fully present!");
         } else {
-            info!("Partial or corrupted write detected: {} / {} bytes present", present, payload_len);
-            if present == payload_len {
-                info!("All bytes present but CRC mismatch -> corruption.");
-            }
+            error!("Object is not fully present!");
         }
     }
 }
 
-fn check_chunks(addr: *const u8, payload_len: usize, chunk_size: usize) -> usize {
-    let payload_ptr = unsafe { addr.add(PAYLOAD_OFFSET) };
+fn check_chunks(addr: usize, payload_len: usize, chunk_size: usize) -> usize {
+    let payload_ptr = addr as *mut u8;
     let mut offset = 0;
 
     while offset < payload_len {
@@ -105,7 +120,7 @@ fn check_chunks(addr: *const u8, payload_len: usize, chunk_size: usize) -> usize
         let actual_slice = unsafe { slice::from_raw_parts(payload_ptr.add(offset), this_chunk) };
 
         // generate expected chunk
-        let expected_slice: Vec<u8> = (offset..offset + this_chunk).map(|i| (i & 0xFF) as u8).collect();
+        let expected_slice: Vec<u8> = (offset..offset + this_chunk).map(|i| message_at(i)).collect();
 
         if actual_slice != expected_slice.as_slice() {
             info!("Chunk at offset {} is inconsistent! {} bytes differ", offset, this_chunk);
@@ -118,11 +133,16 @@ fn check_chunks(addr: *const u8, payload_len: usize, chunk_size: usize) -> usize
     offset
 }
 
+fn message_at(pos_in_payload: usize) -> u8 {
+    const MESSAGE: &[u8; 13] = b"Hello There; ";
+    MESSAGE[pos_in_payload % MESSAGE.len()]
+}
+
 fn pmem_write(addr: *mut u8, payload_len: usize, chunk_size: usize, delay_ms: usize, flush_each_chunk: bool) {
     // prepare payload (deterministic pattern)
     let mut payload = vec![0u8; payload_len];
     for (i, b) in payload.iter_mut().enumerate() {
-        *b = (i & 0xFF) as u8;
+        *b = message_at(i);
     }
 
     // compute CRC for the full payload (we do this before writing)
@@ -131,24 +151,24 @@ fn pmem_write(addr: *mut u8, payload_len: usize, chunk_size: usize, delay_ms: us
         zero_out_unsafe(slice::from_raw_parts_mut(addr as *mut u8, payload_len), payload_len, addr);
 
         // Write header (in-memory copy)
-        let header_ptr = (addr as *mut u8).add(HEADER_OFFSET);
-        ptr::copy_nonoverlapping(MAGIC.as_ptr(), header_ptr, MAGIC.len());
-        // write payload length
-        let len_ptr = header_ptr.add(8) as *mut u64;
-        *len_ptr = payload_len as u64;
-        // write crc32
-        let crc_ptr = header_ptr.add(16) as *mut u32;
-        // the crc pointer was supposed to hold the hash of our object.
-        // But there is no hasher in the kernel, so this is skipped.
-        *crc_ptr = 0;
+        let meta_addr = (addr as *mut u8).add(HEADER_OFFSET) as usize;
+        Meta::write_at_address(meta_addr, MAGIC, payload_len, PAYLOAD_OFFSET);
 
         // flush header immediately
-        msync(header_ptr as *mut _);
+        msync(meta_addr as *mut _);
         info!("Header flushed");
+
+        let meta = Meta::read_meta_at_address(meta_addr);
+        assert_eq!(&meta.magic, MAGIC);
+        assert_eq!(meta.payload_len, payload_len);
+        assert_eq!(meta.payload_offset, PAYLOAD_OFFSET);
 
         // Write payload in chunks
         let mut written = 0usize;
+        let mut i = 0;
         while written < payload_len {
+            info!("Writing chunk {}", i);
+
             let to_write = chunk_size.min(payload_len - written);
             let dst = (addr as *mut u8).add(PAYLOAD_OFFSET + written);
             let src = payload[written..written + to_write].as_ptr();
@@ -163,8 +183,10 @@ fn pmem_write(addr: *mut u8, payload_len: usize, chunk_size: usize, delay_ms: us
                 info!("msync chunk done");
             }
 
+            info!("Wrote chunk {i} and sleeping for {delay_ms}!");
             // sleep so you have time to kill QEMU from the host
             sys_thread_sleep(delay_ms);
+            i += 1;
         }
 
         info!("Finished writing payload. Final msync of payload.");
