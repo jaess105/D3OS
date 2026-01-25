@@ -28,6 +28,7 @@ use crate::interrupt::interrupt_dispatcher::InterruptDispatcher;
 use crate::log::Logger;
 use crate::memory::PAGE_SIZE;
 use crate::memory::acpi_handler::AcpiHandler;
+use crate::memory::global_persistent_allocator::GlobalPersistentAllocator;
 use crate::memory::heap::KernelAllocator;
 use crate::process::process_manager::ProcessManager;
 use crate::process::scheduler::Scheduler;
@@ -35,7 +36,7 @@ use crate::syscall::sys_graphic::LfbInfo;
 use crate::syscall::syscall_dispatcher::CoreLocalStorage;
 use alloc::format;
 use graphic::color::{BLUE, WHITE};
-use ::log::{Level, Log, Record, error};
+use ::log::{Level, Log, Record, error, info};
 use acpi::AcpiTables;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -256,6 +257,21 @@ static ALLOCATOR: KernelAllocator = KernelAllocator::new();
 
 pub fn allocator() -> &'static KernelAllocator {
     &ALLOCATOR
+}
+
+// Global Persistent Allocator
+// Used for persistent memory allocation
+static PERSISTENT_ALLOCATOR: Once<RwLock<GlobalPersistentAllocator>> = Once::new();
+
+pub fn init_persistent_allocator(allocator: GlobalPersistentAllocator) {
+    info!("Initializing persistent allocator in global storage");
+    PERSISTENT_ALLOCATOR.call_once(|| RwLock::new(allocator));
+}
+
+pub fn persistent_allocator() -> &'static RwLock<GlobalPersistentAllocator> {
+    PERSISTENT_ALLOCATOR
+        .get()
+        .expect("Trying to access persistent allocator before initialization!")
 }
 
 /// Kernel logger.

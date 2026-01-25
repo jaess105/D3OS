@@ -12,7 +12,9 @@ pub mod heap;
 pub mod stack;
 pub mod acpi_handler;
 
+pub mod global_persistent_allocator;
 pub mod nvmem_inconsistent_test;
+pub mod pool;
 
 #[derive(PartialEq)]
 #[derive(Clone, Copy, Debug)]

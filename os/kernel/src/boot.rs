@@ -8,11 +8,11 @@
    ╚═════════════════════════════════════════════════════════════════════════╝
 */
 
-use crate::consts;
 use crate::device::pit::Timer;
 use crate::device::ps2::{Keyboard, Mouse};
 use crate::device::serial::SerialPort;
 use crate::interrupt::interrupt_dispatcher;
+use crate::memory::global_persistent_allocator::GlobalPersistentAllocator;
 use crate::memory::nvmem::Nfit;
 use crate::memory::pages::page_table_index;
 use crate::memory::vma::VmaType;
@@ -24,6 +24,7 @@ use crate::{
     init_lfb, init_lfb_info, init_pci, init_serial_port, init_tty, keyboard, logger, mouse, process_manager, scheduler, serial_port, timer, tss,
 };
 use crate::{built_info, memory, naming, network, storage};
+use crate::{consts, init_persistent_allocator, persistent_allocator};
 
 use alloc::format;
 use alloc::string::ToString;
@@ -295,6 +296,7 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
     // As a demo for NVRAM support, we read the last boot time from NVRAM and write the current boot time to it
     if let Ok(nfit) = acpi_tables().lock().find_table::<Nfit>() {
         if let Some(range) = nfit.get_phys_addr_ranges().first() {
+            /* 
             let date_ptr = range.as_phys_frame_range().start.start_address().as_u64() as *mut Time;
 
             // Read last boot time from NVRAM
@@ -317,6 +319,33 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
                     unsafe { date_ptr.write(time) }
                 }
             }
+            */
+
+            let nvram_base = range.as_phys_frame_range().start.start_address().as_u64();
+            let nvram_size = (range.as_phys_frame_range().end - range.as_phys_frame_range().start) as usize * PAGE_SIZE;
+
+            let allocator = GlobalPersistentAllocator::new(nvram_base, nvram_size);
+            init_persistent_allocator(allocator);
+
+            //Can also be called outside this scope with the exact same line!
+            let mut allocator = persistent_allocator().write();
+
+            let pool = allocator.get_or_create_pool(b"POOL1").unwrap();
+
+            match pool.transaction(|tx| {
+                //let a = tx.get_by_id::<u64>("data1")?;
+                //tx.modify(a, |n| *n += 1)?;
+                tx.allocate_with_id("data1", 48879u64)?;
+                //Let Qemu crash.
+                //If you test this. try the get_by_id function and see that the transaction fails correctly
+                //qemu_exit(1);
+                Ok(())
+            }) {
+                Ok(_) => info!("Transaction successful"),
+                Err(e) => info!("Transaction failed Correctly: {:?}", e),
+            };
+
+            allocator.print_active_pools();
         }
     }
 
