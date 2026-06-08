@@ -212,9 +212,7 @@ fn handle_page_fault(frame: InterruptStackFrame, _index: u8, error: Option<u64>)
     let fault_addr = Cr2::read().expect("Invalid address in CR2 during page fault");
     let thread = scheduler().try_get_current_thread();
     if thread.is_none() {
-        info!("******** Page fault not handled because scheduler is locked **********");
-        return ;
-//        panic!("Page Fault, cannot get lock to scheduler\nError code: [{:?}]\nAddress: [0x{:0>16x}]", error, fault_addr);
+        panic!("Page Fault, cannot get lock to scheduler\nError code: [{:?}]\nAddress: [0x{:0>16x}]", error, fault_addr);
     }
 
     let thread = thread.unwrap();

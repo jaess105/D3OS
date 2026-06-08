@@ -37,6 +37,7 @@ use crate::process::scheduler::{MessageItem, PerCpuRef};
 use crate::syscall::sys_graphic::LfbInfo;
 
 use alloc::boxed::Box;
+use alloc::fmt::Write;
 use alloc::format;
 use alloc::vec::Vec;
 use chrono::{DateTime, FixedOffset, TimeDelta};
@@ -46,7 +47,7 @@ use acpi::AcpiTables;
 use alloc::string::String;
 use alloc::sync::Arc;
 use x86_64::instructions::interrupts;
-use core::fmt::Arguments;
+use core::fmt::{Arguments, Display};
 use core::hint::spin_loop;
 use core::panic::PanicInfo;
 use device::tty::{TtyInput, TtyOutput};
@@ -89,6 +90,46 @@ pub mod built_info {
     include!(concat!(env!("OUT_DIR"), "/built.rs"));
 }
 
+/// static sized Strings using a u8 buffer
+/// 
+/// used for heap-less panics & logging
+#[derive(Debug, Copy, Clone)]
+pub struct D3OSStaticString<const SIZE: usize> {
+    buffer: [u8; SIZE],
+    index: usize,
+}
+
+impl <const SIZE: usize> D3OSStaticString<SIZE> {
+
+    pub const fn new() -> Self {
+        D3OSStaticString { buffer: ['\0' as u8; SIZE], index: 0 }
+    }
+
+    pub fn as_str(&self) -> Result<&str, core::str::Utf8Error> {
+        let utf8 = str::from_utf8(&self.buffer)?;
+        let utf8_trimmed = match utf8.find('\0') {
+            Some(i) => &utf8[0..i],
+            None => utf8,
+        };
+        Ok(utf8_trimmed)
+    }
+
+    pub fn clear(&mut self) {
+        self.buffer.fill('\0' as u8);
+        self.index = 0;
+    }
+}
+
+impl <const SIZE: usize> Write for D3OSStaticString<SIZE> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let i = self.index;
+        let l = core::cmp::min(self.buffer.len() - i, s.len());
+        self.buffer[i..(l+i)].copy_from_slice(&s.as_bytes()[..l]);
+        self.index = self.index.wrapping_add(l);
+        return Ok(());
+    }
+}
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     // make sure we never exit
@@ -97,36 +138,40 @@ fn panic(info: &PanicInfo) -> ! {
     // write the panic directly out to the serial port
     // this needs no allocations and should always work
     unsafe { logger().force_unlock() };
-    error!("Panic:");
-    let args = info.message().as_str().unwrap_or("(no message provided)");
+    error!("--- Panic ---");
+
+    let args = format_args!("{info}");
     let record = Record::builder()
         .level(Level::Error)
         .file(info.location().map(|l| l.file()))
         .line(info.location().map(|l| l.line()))
-        .args(Arguments::from_str_nonconst(args))
+        .args(args)
         .build();
 
     logger().log(&record);
+
+    let mut panic_message: D3OSStaticString<256> = D3OSStaticString::new();
+    write!(panic_message, "{info}");
+    let panic_message_str = panic_message.as_str().expect("UTF-8 error in panic message!");
+    let panic_message_trimmed = match panic_message_str.find('\0') {
+        Some(i) => &panic_message_str[0..i],
+        None => panic_message_str,
+    };
         
     // if we do have a terminal, try to print the error there, too
-    let lfb_info = BUFFERED_LFB.get().map(|lfb| {
+    let _lfb_info = BUFFERED_LFB.get().map(|lfb| {
         unsafe { lfb.force_unlock() };
         let mut lfb = lfb.try_lock().unwrap();
         let lfb_height = lfb.direct_lfb().height();
         let lfb_width = lfb.direct_lfb().width();
         lfb.direct_lfb().fill_rect(lfb_width/8, lfb_height/4, lfb_width * 3 / 4, lfb_height/3, BLUE);
         lfb.direct_lfb().draw_string(lfb_width/7, lfb_height/3, WHITE, BLUE, "D3OS has encountered an unknown error:");
+
+        for (line_idx, line) in panic_message_trimmed.split('\n').enumerate() {
+            lfb.direct_lfb().draw_string(lfb_width/7, lfb_height/3 + 48 + line_idx as u32 * 20, WHITE, BLUE, line);
+        }
         (lfb, lfb_height, lfb_width)
     });
-    // if we do have an allocator already, try to use it to print more information
-    // this might fail, but we got the basic information out already
-    if allocator().is_initialized() {
-        let message = format!("{info}");
-        error!("{message}");
-        if let Some((mut lfb, lfb_height, lfb_width)) = lfb_info {
-            lfb.direct_lfb().draw_string(lfb_width/7, lfb_height/2, WHITE, BLUE, &message);
-        }
-    }
 
     loop {
         spin_loop();
