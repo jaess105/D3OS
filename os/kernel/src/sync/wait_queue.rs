@@ -13,7 +13,6 @@
 */
 
 use alloc::collections::VecDeque;
-use log::info;
 use uuid::Uuid;
 
 use crate::{process::core_local_storage::scheduler, sync::irqsave_spinlock::IrqSaveSpinlock};
@@ -30,13 +29,10 @@ impl WaitQueue {
     }
 
     /// Block until `pred()` becomes true.
-    pub fn wait<F>(&self, mut pred: F, message: &str)
+    pub fn wait<F>(&self, mut pred: F, _message: &str)
     where
         F: FnMut() -> bool,
     {
-        //        info!("WaitQueue::wait");
-        let (pid, tid) = scheduler().current_ids();
-
         loop {
             if pred() {
                 return;
@@ -50,25 +46,12 @@ impl WaitQueue {
                     return;
                 }
 
-                guard.push_back((pid, tid));
-
                 // park after we are visible to notifiers
-                scheduler().park_current();
+                let ids = scheduler().park_current();
+                guard.push_back(ids);
             }
 
-            scheduler().yield_now(); 
-        }
-
-        info!("WaitQueue::wait: Thread with PID={}, TID={} is now waiting, message = {}", pid, tid, message);
-
-        // Check predicate without acquiring the queue lock.
-        // The scheduler will block us, as long as no `notify_one` and `notify_all` have arrived
-        // But even after waking up we need to check for spurious wakeups, so we loop here.
-        loop {
-            if pred() {
-                return;
-            }
-            core::hint::spin_loop();
+            scheduler().block_if_parking(|| !pred());
         }
     }
 
