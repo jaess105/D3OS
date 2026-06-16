@@ -621,6 +621,7 @@ impl Scheduler {
             // let mut state = self.get_ready_state();
             thread.set_state(ThreadState::Ready);
             state.ready_queue.push_front(Arc::clone(&thread));
+            inc_rq_len();
             return true;
         }
 
