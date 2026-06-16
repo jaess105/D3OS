@@ -633,13 +633,23 @@ impl Scheduler {
             }
 
         // 2b) Check if the thread to be woken up is in the ready queue
-        if let Some(thread) = state.ready_queue.iter().find(|t| t.id() == tid && t.process().id() == pid) {
-                curr_thread.set_state(ThreadState::Ready);
+            if state.ready_queue.iter().any(|t| t.id() == tid && t.process().id() == pid) {
+                // Already runnable (e.g. a previous wakeup raced in); nothing to do
                 return true;
             }
         }
 
-        // 3) Thread not found in any known list.
+        // 3) Not found on this core. The thread may be blocked on the
+        // `blocked_list` of another core (the scheduler is core-local), so ask
+        // every other core to deblock it. The owning core's `Deblock` handler
+        // does the matching `inc_rq_len()`. Only broadcast for live threads to
+        // avoid waking stale (exited) waiters.
+        if is_thread_alive(tid) {
+            drop(state); // release ready_state before cross-core scheduling
+            schedule_on_all_others(MessageItem::Cmd(MessageCmd::Deblock { pid, tid }));
+            return true;
+        }
+
         false
     }
 
