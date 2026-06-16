@@ -566,6 +566,38 @@ impl Scheduler {
         (thread.process().id(), thread.id())
     }
 
+    /// Block the calling thread, but only if it should still wait.
+    pub fn block_if_parking<F>(&self, mut should_wait: F)
+    where
+        F: FnMut() -> bool,
+    {
+        let state = self.get_ready_state();
+
+        if !state.initialized {
+            return;
+        }
+
+        let thread = Scheduler::current(&state);
+        if thread.state() != ThreadState::Parking {
+            // A wakeup raced in between registering and blocking; do not block.
+            return;
+        }
+
+        if !should_wait() {
+            // The condition was satisfied while we were registering; a racing
+            // `unblock` may not have found us, so cancel the block ourselves.
+            thread.set_state(ThreadState::Running);
+            return;
+        }
+
+        {
+            let mut block_list = self.blocked_list.lock();
+            block_list.push(Arc::clone(&thread));
+        }
+        dec_rq_len();
+        self.block_and_switch(state);
+    }
+
     /// Unblock thread with given (pid, tid). \
     /// Returns true if thread was found and unblocked, false otherwise.
     pub fn unblock(&self, pid: Uuid, tid: usize) -> bool {
