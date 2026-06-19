@@ -93,6 +93,17 @@ For further commands check [GDB Quick Reference](docs/gdb-commands.pdf).
 The repository contains debug configurations for RustRover, Visual Studio Code and Zed.
 To debug userspace applications, you might need to modify them.
 
+#### Visual Studio Code
+
+A rustgdb launch configuration for visual studio code is provided.
+
+To debug a userspace application, you need to adjust the .vscode/launch.json file. Here, the line 
+```bash
+{"text": "add-symbol-file ${workspaceRoot}/loader/initrd/bin/hello"}
+```
+needs to be adjusted for the specific application, by changing 'hello' to the desired application name.
+
+
 ## Creating a bootable USB stick
 
 ### Using towboot
