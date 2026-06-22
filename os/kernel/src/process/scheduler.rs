@@ -570,6 +570,38 @@ impl Scheduler {
         (thread.process().id(), thread.id())
     }
 
+    /// Block the calling thread, but only if it should still wait.
+    pub fn block_if_parking<F>(&self, mut should_wait: F)
+    where
+        F: FnMut() -> bool,
+    {
+        let state = self.get_ready_state();
+
+        if !state.initialized {
+            return;
+        }
+
+        let thread = Scheduler::current(&state);
+        if thread.state() != ThreadState::Parking {
+            // A wakeup raced in between registering and blocking; do not block.
+            return;
+        }
+
+        if !should_wait() {
+            // The condition was satisfied while we were registering; a racing
+            // `unblock` may not have found us, so cancel the block ourselves.
+            thread.set_state(ThreadState::Running);
+            return;
+        }
+
+        {
+            let mut block_list = self.blocked_list.lock();
+            block_list.push(Arc::clone(&thread));
+        }
+        dec_rq_len();
+        self.block_and_switch(state);
+    }
+
     /// Unblock thread with given (pid, tid). \
     /// Returns true if thread was found and unblocked, false otherwise.
     pub fn unblock(&self, pid: Uuid, tid: usize) -> bool {
@@ -593,6 +625,7 @@ impl Scheduler {
             // let mut state = self.get_ready_state();
             thread.set_state(ThreadState::Ready);
             state.ready_queue.push_front(Arc::clone(&thread));
+            inc_rq_len();
             return true;
         }
 
@@ -604,13 +637,23 @@ impl Scheduler {
             }
 
         // 2b) Check if the thread to be woken up is in the ready queue
-        if let Some(thread) = state.ready_queue.iter().find(|t| t.id() == tid && t.process().id() == pid) {
-                curr_thread.set_state(ThreadState::Ready);
+            if state.ready_queue.iter().any(|t| t.id() == tid && t.process().id() == pid) {
+                // Already runnable (e.g. a previous wakeup raced in); nothing to do
                 return true;
             }
         }
 
-        // 3) Thread not found in any known list.
+        // 3) Not found on this core. The thread may be blocked on the
+        // `blocked_list` of another core (the scheduler is core-local), so ask
+        // every other core to deblock it. The owning core's `Deblock` handler
+        // does the matching `inc_rq_len()`. Only broadcast for live threads to
+        // avoid waking stale (exited) waiters.
+        if is_thread_alive(tid) {
+            drop(state); // release ready_state before cross-core scheduling
+            schedule_on_all_others(MessageItem::Cmd(MessageCmd::Deblock { pid, tid }));
+            return true;
+        }
+
         false
     }
 
