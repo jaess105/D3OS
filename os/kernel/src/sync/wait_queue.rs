@@ -12,7 +12,7 @@
    ╚═════════════════════════════════════════════════════════════════════════╝
 */
 
-use alloc::collections::VecDeque;
+use alloc::{collections::VecDeque, vec::Vec};
 use uuid::Uuid;
 
 use crate::{process::core_local_storage::scheduler, sync::irqsave_spinlock::IrqSaveSpinlock};
@@ -33,6 +33,8 @@ impl WaitQueue {
     where
         F: FnMut() -> bool,
     {
+        let ids = scheduler().current_ids();
+
         loop {
             if pred() {
                 return;
@@ -46,44 +48,54 @@ impl WaitQueue {
                     return;
                 }
 
-                // park after we are visible to notifiers
-                let ids = scheduler().park_current();
+                // register current thread with the WaitQueue
                 guard.push_back(ids);
             }
 
-            scheduler().block_if_parking(|| !pred());
+            scheduler().block();
         }
     }
 
     /// Wake up exactly one waiter (if any). Returns true if someone was woken up.
     pub fn notify_one(&self) -> bool {
-        //  info!("WaitQueue::notify_one");
-
         let mut guard = self.queue.lock();
+        
+        let mut unblocked_success_idx = None;
 
-        while let Some((pid, tid)) = guard.pop_front() {
-            if scheduler().unblock(pid, tid) {
-                // info!("WaitQueue::notify_one: found a waiter");
-                return true;
+        // check queue until one thread is successfully unblocked
+        for (idx, (pid, tid)) in guard.iter().enumerate() {
+            if scheduler().unblock(*pid, *tid) {
+                unblocked_success_idx = Some(idx);
+                break;
             }
-            // else: stale waiter (killed/exited) -> keep going
         }
-        //    info!("WaitQueue::notify_one: no waiter found");
 
-        false
+        match unblocked_success_idx {
+            Some(idx) => guard.remove(idx).is_some(),
+            None => false
+        }
     }
 
     /// Wake up all waiters currently queued.
     /// Returns the number of threads actually unblocked (stale entries are ignored).
     pub fn notify_all(&self) -> usize {
         let mut guard = self.queue.lock();
+        
+        let mut unblocked_success_idxs = Vec::new();
+
+        // check queue until one thread is successfully unblocked
+        for (idx, (pid, tid)) in guard.iter().enumerate() {
+            if scheduler().unblock(*pid, *tid) {
+                unblocked_success_idxs.push(idx);
+            }
+        }
+
         let mut woke = 0;
 
-        while let Some((pid, tid)) = guard.pop_front() {
-            if scheduler().unblock(pid, tid) {
+        for idx in unblocked_success_idxs {
+            if guard.remove(idx as usize).is_some() {
                 woke += 1;
             }
-            // else: stale waiter (killed/exited) -> ignore
         }
 
         woke

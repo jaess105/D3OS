@@ -336,8 +336,7 @@ impl Scheduler {
         if let Some(pos) = block_list.iter().position(|thread| thread.id() == tid && thread.process().id() == pid) {
             let thread = block_list.remove(pos);
             self.ready(thread);
-        }
-        else {
+        } else {
             schedule_on_all_others(MessageItem::Cmd(MessageCmd::Deblock {pid, tid}))
         }
     }
