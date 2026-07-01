@@ -8,7 +8,6 @@
    ╚═════════════════════════════════════════════════════════════════════════╝
 */
 #![feature(allocator_api)]
-#![feature(alloc_layout_extra)]
 #![feature(fmt_internals)]
 #![feature(abi_x86_interrupt)]
 #![feature(map_try_insert)]
