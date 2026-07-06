@@ -36,7 +36,7 @@
    ║   - pfr_from_pr_identity      get pfr range from page range identity    ║
    ╟─────────────────────────────────────────────────────────────────────────╢
    ║ Author: Fabian Ruhland and Michael Schoettner                           ║
-   ║         Univ. Duesseldorf, 2.4.2026                                     ║
+   ║         Univ. Duesseldorf, 6.7.2026                                     ║
    ╚═════════════════════════════════════════════════════════════════════════╝
 */
 
@@ -598,6 +598,7 @@ impl VirtualAddressSpace {
     /// set free_physical to free the frames
     pub fn unmap_vma(&self, vma: Arc<VirtualMemoryArea>, free_physical: bool) {
         self.page_tables.unmap(vma.range, free_physical);
+        self.virtual_memory_areas.write().remove(&vma.start());
     }
 }
 
