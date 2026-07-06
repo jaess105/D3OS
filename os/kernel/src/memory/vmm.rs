@@ -42,6 +42,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use log::error;
 use uuid::Uuid;
 use core::ops::{Add, Range};
 use log::{info, warn};
@@ -254,13 +255,15 @@ impl VirtualAddressSpace {
         // Check predecessor or exact same-start VMA.
         if let Some((_, prev)) = vmas.range(..=new_vma_start_addr).next_back() {
             if prev.end() > new_vma_start_addr {
+                error!("allocation failed: {new_vma:?} overlaps {prev:?}");
                 return None;
             }
         }
 
         // Check successor.
-        if let Some((next_start, _next)) = vmas.range(new_vma_start_addr..).next() {
+        if let Some((next_start, next)) = vmas.range(new_vma_start_addr..).next() {
             if new_vma_end_addr > *next_start {
+                error!("allocation failed: {new_vma:?} overlaps {next:?}");
                 return None;
             }
         }
