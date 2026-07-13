@@ -7,14 +7,12 @@
    ║ Author: Fabian Ruhland & Michael Schoettner, HHU                        ║
    ╚═════════════════════════════════════════════════════════════════════════╝
 */
-
 use crate::device::apic::get_cpu_count;
-use crate::process::core_local_storage::{init_gdt_for_this_core, install_gs_base, local_apic_static, scheduler, scheduler_start};
-use crate::syscall::sys_time::sys_get_system_time;
+use crate::process::core_local_storage::{init_gdt_for_this_core, install_gs_base, scheduler, scheduler_start};
 use crate::{consts, ipi, per_cpu_init};
 use crate::device::pit::Timer;
 use crate::device::ps2::{Keyboard, Mouse};
-use crate::device::{virtio};
+use crate::device::{cpu, virtio};
 use crate::device::serial::SerialPort;
 use crate::interrupt::interrupt_dispatcher;
 use crate::memory::nvmem::Nfit;
@@ -40,7 +38,7 @@ use core::ffi::c_void;
 use core::mem::size_of;
 use core::ops::Deref;
 use core::ptr;
-use log::{trace, debug, info, warn, LevelFilter};
+use log::{info, warn, LevelFilter};
 use multiboot2::{BootInformation, BootInformationHeader, EFIMemoryMapTag, MemoryAreaType, MemoryMapTag, TagHeader};
 use uefi::data_types::Handle;
 use uefi::mem::memory_map::MemoryMap;
@@ -178,15 +176,14 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
     // with a heap, we can initialize the page frame allocator
     memory::init();
     memory::dump();
+
+    // Enable required CPU extensions
+    info!("Enabling SIMD and FSGSBASE instructions");
+    cpu::enable_simd();
+    cpu::enable_fsgsbase();
   
     // Initialize CPU information
     init_cpu_info();
-
-    // Enable FSGSBASE
-    info!("Enabling FSGSBASE instructions");
-    unsafe {
-        Cr4::update(|flags| flags.insert(Cr4Flags::FSGSBASE));
-    }
 
     // Create kernel process (and initialize virtual memory management)
     info!("Create kernel process and initialize paging");
@@ -634,7 +631,6 @@ fn kernel_cr3() -> *mut u64 {
 }
 
 fn ap_boot_region() -> PhysFrameRange {
-
     let start = PhysFrame::from_start_address(PhysAddr::new(boot_ap_start() as u64))
         .expect("AP boot code is not page aligned");
     let end = PhysFrame::from_start_address(PhysAddr::new(boot_ap_end() as u64)
