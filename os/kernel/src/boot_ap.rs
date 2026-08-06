@@ -40,7 +40,7 @@ pub extern "C" fn startup_ap(cpu_id: u32) {
     apic().start_timer(10);
     scheduler_start();
 
-    loop {}
+    unreachable!()
 }
 
 /// Thread for testing multicore scheduling

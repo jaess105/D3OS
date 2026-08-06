@@ -411,6 +411,7 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
     //     info!("System time: {}", sys_get_system_time());
     // }
     scheduler_start();
+    unreachable!()
 }
 
 /// Set up the GDT

@@ -12,8 +12,7 @@ use x2apic::lapic::LocalApic;
 use x86_64::instructions::segmentation::{Segment, CS, DS, ES, FS, GS, SS};
 use x86_64::instructions::tables::load_tss;
 use x86_64::PrivilegeLevel::Ring0;
-use x86_64::registers::model_specific::KernelGsBase;
-use x86_64::registers::segmentation::SegmentSelector;
+use x86_64::registers::segmentation::{Segment64, SegmentSelector};
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable};
 use x86_64::structures::tss::TaskStateSegment;
 use x86_64::VirtAddr;
@@ -23,10 +22,11 @@ use crate::take_inbox_receiver;
 
 const PREEMPT_COUNT_OFFSET: usize = offset_of!(CoreLocalStorage, preempt_count);
 
-/// Core Local Storage.
-/// Contains information, which is needed by the syscall handler.
-/// The TSS address is never accessed directly, but via the swapgs instruction.
-/// 'boot.rs' sets up the gs base register with a pointer to this struct for the boot processor.
+/// Core Local Storage
+/// 
+/// This struct contains information, which is needed eg. by the syscall handler.
+/// It is quickly accessible via the (kernel's) GS register.
+/// 'boot.rs' sets up the gs base register for the boot processor.
 /// Since multicore is implemented, we have one of these per core.
 #[repr(C)]
 pub struct CoreLocalStorage {
@@ -96,37 +96,21 @@ fn create_core_local_storage(id: u32) -> *mut CoreLocalStorage {
     let cpu_local = Box::new(core_local_storage);
     let addr = Box::leak(cpu_local) as *mut CoreLocalStorage;
     unsafe { (*addr).self_ptr = addr; }
-    addr as *mut CoreLocalStorage
+    addr
 }
 
 /// Installs a Cpu Local Storage on the GS segment
 pub fn install_gs_base(id: u32) {
     let core_local_ptr = create_core_local_storage(id);
-    KernelGsBase::write(VirtAddr::from_ptr(core_local_ptr));
+    unsafe { GS::write_base(VirtAddr::from_ptr(core_local_ptr)) };
+    info!("gsbase for {}: {:?}", id, GS::read_base());
     set_inbox_apic_id(id as usize);    //sets the apic_id of the current core in the PER_CPU_SCHED Array
-}
-
-/// reads the IA32_KERNEL_GS_BASE MSR and returns the value as u64
-/// does not switch gs bases but is slower
-#[inline(always)]
-fn read_kernel_gs_base() -> u64 {
-    let lo: u32;
-    let hi: u32;
-    unsafe {
-        core::arch::asm!(
-        "rdmsr",
-        in("ecx") 0xC000_0102u32, // IA32_KERNEL_GS_BASE
-        out("eax") lo,
-        out("edx") hi,
-        options(nomem, nostack, preserves_flags)
-        );
-    }
-    ((hi as u64) << 32) | (lo as u64)
 }
 
 /// Returns the whole CLS from the current GS segment
 #[inline(always)]
-fn cls_ptr_from_gs() -> *mut CoreLocalStorage {
+fn cls_ptr() -> *mut CoreLocalStorage {
+    debug_assert!(!GS::read_base().is_null());
     let struct_ptr: u64;
     unsafe {
         core::arch::asm!(
@@ -137,44 +121,6 @@ fn cls_ptr_from_gs() -> *mut CoreLocalStorage {
     }
     struct_ptr as *mut CoreLocalStorage
 }
-/// Returns the whole CLS from the switched kernelGS-Base
-#[inline(always)]
-pub fn cls_ptr() -> *mut CoreLocalStorage {
-    with_kernel_gs( || { cls_ptr_from_gs()})
-}
-
-/// wraps the code of another method with "swapgs" calls to get access to the
-/// kernelGS-Base instead of the GS-Base during execution
-/// also saves the current IF and restores it afterwards
-#[inline(always)]
-pub fn with_kernel_gs<R>(f: impl FnOnce() -> R) -> R {
-    unsafe {
-        //save current rflags to restore interrupt flag afterwards
-        let mut rflags: u64;
-        core::arch::asm!(
-        "pushfq",
-        "pop {rflags}",
-        rflags = out(reg) rflags,
-        options(preserves_flags)
-        );
-        preempt_disable_no_swap();
-        core::arch::asm!("cli", options(nomem, nostack));
-        core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags));
-
-        let ret = f();
-
-        // Swap GS back first, then restore IF if it was previously set
-        core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags));
-        if (rflags & (1 << 9)) != 0 {
-            core::arch::asm!("sti", options(nomem, nostack));
-        }
-        preempt_enable_no_swap();
-        ret
-    }
-}
-
-
-
 
     //// Preemption Guard and accessors ////
 
@@ -239,28 +185,28 @@ pub fn cls_mut() -> ClsGuard<&'static mut CoreLocalStorage> {
 pub struct PreemptGuard { /* !Send, !Sync; holds pinned state */ }
 impl Drop for PreemptGuard {
     #[inline(always)]
-    fn drop(&mut self) { preempt_enable_no_swap(); }
+    fn drop(&mut self) { preempt_enable(); }
 }
 
 impl PreemptGuard {
     #[inline(always)]
-    pub fn new() -> Self { preempt_disable_no_swap(); Self{} }
+    pub fn new() -> Self { preempt_disable(); Self{} }
 }
 
-/// Disables preemption temporarily without switching gs bases.
+/// Disables preemption temporarily.
 #[inline(always)]
-fn preempt_disable_no_swap() {
-    let base = read_kernel_gs_base() as *mut u8;
+fn preempt_disable() {
+    let base: *mut u8 = cls_ptr().cast();
     unsafe {
         let cnt_ptr = base.add(PREEMPT_COUNT_OFFSET) as *mut AtomicUsize;
         (*cnt_ptr).fetch_add(1, Ordering::SeqCst);
     }
 }
 
-/// Enables preemption temporarily without switching gs bases.
+/// Enables preemption temporarily.
 #[inline(always)]
-fn preempt_enable_no_swap() {
-    let base = read_kernel_gs_base() as *mut u8;
+fn preempt_enable() {
+    let base: *mut u8 = cls_ptr().cast();
     let prev_counter;
     unsafe {
         let cnt_ptr = base.add(PREEMPT_COUNT_OFFSET) as *mut AtomicUsize;
@@ -272,27 +218,18 @@ fn preempt_enable_no_swap() {
 /// Returns true if preemption is currently disabled. (without switching gs bases)
 #[inline(always)]
 pub fn preempt_is_disabled() -> bool {
-    let base = read_kernel_gs_base() as *mut u8;
+    let base: *const u8 = cls_ptr().cast();
     unsafe {
-        let cnt_ptr = base.add(PREEMPT_COUNT_OFFSET) as *mut AtomicUsize;
+        let cnt_ptr = base.add(PREEMPT_COUNT_OFFSET) as *const AtomicUsize;
         (*cnt_ptr).load(Ordering::SeqCst) != 0
     }
 }
 
-
-
-
     //// Everything about the fields of the CLS ////
-
-/// Returns the core id from the GS segment after switching the GS Segment back and forth
-#[inline(always)]
-pub fn current_core_id() -> u32 {
-    with_kernel_gs( || { current_core_id_from_gs()})
-}
 
 /// Returns the core id from the CURRENT GS segment
 #[inline(always)]
-pub fn current_core_id_from_gs() -> u32 {
+pub fn current_core_id() -> u32 {
     let id: u32;
     unsafe {
         core::arch::asm!(
@@ -367,7 +304,7 @@ pub fn init_gdt_for_this_core() {
         DS::set_reg(SegmentSelector::new(0, Ring0));
         ES::set_reg(SegmentSelector::new(0, Ring0));
         FS::set_reg(SegmentSelector::new(0, Ring0));
-        GS::set_reg(SegmentSelector::new(0, Ring0));
+        // GS is used for the CoreLocalStorage and already set correctly
     }
 }
 

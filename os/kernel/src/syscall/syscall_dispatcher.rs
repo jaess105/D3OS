@@ -76,8 +76,7 @@ pub fn init() {
     // The CPU clears every flag that is set in the SFMask register
     SFMask::write(RFlags::INTERRUPT_FLAG);
 
-    // Initialize TSS rsp0 in core local storage (accessible via 'swapgs')
-    //let mut core_local_storage = core_local_storage().lock();
+    // Initialize TSS rsp0 in core local storage (accessible via gs)
     init_tss_cls();
 }
 
@@ -173,7 +172,6 @@ unsafe extern "sysv64" fn syscall_handler() {
     "mov rsp, gs:[{CORE_LOCAL_STORAGE_TSS_RSP0_PTR_INDEX}]", // Load pointer to rsp0 entry of tss from core local storage
     "mov rsp, [rsp]", // Dereference rsp0 pointer to switch to kernel stack
     "push gs:[{CORE_LOCAL_STORAGE_USER_RSP_INDEX}]", // Store user rip on kernel stack (core local storage might be overwritten, when a thread switch occurs during system call execution)
-    "swapgs", // Restore gs base
 
     // Store registers according to System V AMD64 ABI
     // (except rax, which is used for system call ID and return value)
@@ -216,6 +214,7 @@ unsafe extern "sysv64" fn syscall_handler() {
     "pop rsp", // Restore rsp from kernel stack
 
     // Return to Ring 3
+    "swapgs", // Restore user gs base
     // Interrupts will be enabled automatically, because rflags is restored from r11
     "sysretq",
     NUM_SYSCALLS = const NUM_SYSCALLS,
