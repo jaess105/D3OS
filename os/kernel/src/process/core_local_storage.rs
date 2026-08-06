@@ -1,8 +1,7 @@
 use alloc::boxed::Box;
-use core::mem::{offset_of, ManuallyDrop};
+use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 use core::ptr;
-use core::sync::atomic::{AtomicUsize, Ordering};
 use log::info;
 use raw_cpuid::CpuId;
 use spin::{Mutex};
@@ -19,8 +18,6 @@ use x86_64::VirtAddr;
 use crate::device::apic::Apic;
 use crate::process::scheduler::{per_cpu_apic_id, set_inbox_apic_id, Scheduler, MessageItem};
 use crate::take_inbox_receiver;
-
-const PREEMPT_COUNT_OFFSET: usize = offset_of!(CoreLocalStorage, preempt_count);
 
 /// Core Local Storage
 /// 
@@ -40,7 +37,6 @@ pub struct CoreLocalStorage {
     gdt: Mutex<GlobalDescriptorTable>,
     scheduler: Scheduler,
     rx: Receiver<Option<MessageItem>>,  // single owner (this core)
-    preempt_count: AtomicUsize,
 }
 
 impl CoreLocalStorage {
@@ -56,7 +52,6 @@ impl CoreLocalStorage {
             gdt: Mutex::new(GlobalDescriptorTable::new()),
             scheduler: Scheduler::new(),
             rx: take_inbox_receiver(id as usize),
-            preempt_count: AtomicUsize::new(0),
         }
     }
 
@@ -122,27 +117,31 @@ fn cls_ptr() -> *mut CoreLocalStorage {
     struct_ptr as *mut CoreLocalStorage
 }
 
-    //// Preemption Guard and accessors ////
+    //// Guard and accessors ////
 
 /// Preemption Guard
 pub struct ClsGuard<R> {
-    _preempt: PreemptGuard,
+    _guard: MigrationGuard,
     r: R,
 }
+
 impl<R> ClsGuard<R> {
     fn new(r: R) -> Self {
-        let _preempt = PreemptGuard::new();
-        Self { _preempt, r }
+        let _guard = MigrationGuard::new();
+        Self { _guard, r }
     }
 }
+
 impl<'a> Deref for ClsGuard<&'a CoreLocalStorage> {
     type Target = CoreLocalStorage;
     fn deref(&self) -> &CoreLocalStorage { self.r }
 }
+
 impl<'a> Deref for ClsGuard<&'a mut CoreLocalStorage> {
     type Target = CoreLocalStorage;
     fn deref(&self) -> &CoreLocalStorage { self.r }
 }
+
 impl<'a> DerefMut for ClsGuard<&'a mut CoreLocalStorage> {
     fn deref_mut(&mut self) -> &mut CoreLocalStorage { self.r }
 }
@@ -154,13 +153,13 @@ impl<'a> ClsGuard<&'a CoreLocalStorage> {
         // Prevent `self` from being dropped (moving preempt out manually).
         let me = ManuallyDrop::new(self);
 
-        // Move the preemption guard out (no drop of the old guard).
-        let preempt = unsafe { ptr::read(&me._preempt) };
+        // Move the guard out (no drop of the old guard).
+        let guard = unsafe { ptr::read(&me._guard) };
         // Getting the field reference.
         let sub: &T = f(me.r);
 
         // Building the new guard (keeping preemption disabled).
-        ClsGuard { _preempt: preempt, r: sub }
+        ClsGuard { _guard: guard, r: sub }
     }
 }
 /*
@@ -170,58 +169,42 @@ pub fn scheduler() -> SchedulerRefGuard<'static> {
     cls().map_ref(|c| &c.scheduler)
 }*/
 
-/// CLS getter with preemption guard.
+/// CLS getter with guard.
 pub fn cls() -> ClsGuard<&'static CoreLocalStorage> {
     let r = unsafe { & *cls_ptr() };
     ClsGuard::new(r)
 }
 
-/// mut CLS getter with preemption guard.
+/// mut CLS getter with guard.
 pub fn cls_mut() -> ClsGuard<&'static mut CoreLocalStorage> {
     let r = unsafe { &mut *cls_ptr() };
     ClsGuard::new(r)
 }
 
-pub struct PreemptGuard { /* !Send, !Sync; holds pinned state */ }
-impl Drop for PreemptGuard {
+pub struct MigrationGuard { /* !Send, !Sync; holds pinned state */ }
+impl Drop for MigrationGuard {
     #[inline(always)]
-    fn drop(&mut self) { preempt_enable(); }
+    fn drop(&mut self) { enable_migration(); }
 }
 
-impl PreemptGuard {
+impl MigrationGuard {
     #[inline(always)]
-    pub fn new() -> Self { preempt_disable(); Self{} }
+    pub fn new() -> Self { disable_migration(); Self{} }
 }
 
-/// Disables preemption temporarily.
+/// Disables thread migration temporarily.
 #[inline(always)]
-fn preempt_disable() {
-    let base: *mut u8 = cls_ptr().cast();
-    unsafe {
-        let cnt_ptr = base.add(PREEMPT_COUNT_OFFSET) as *mut AtomicUsize;
-        (*cnt_ptr).fetch_add(1, Ordering::SeqCst);
+fn disable_migration() {
+    if let Some(t) = unsafe { cls_ptr().as_ref_unchecked() }.scheduler.try_current_thread() {
+        t.incr_cls_ref();
     }
 }
 
-/// Enables preemption temporarily.
+/// Enables thread migration temporarily.
 #[inline(always)]
-fn preempt_enable() {
-    let base: *mut u8 = cls_ptr().cast();
-    let prev_counter;
-    unsafe {
-        let cnt_ptr = base.add(PREEMPT_COUNT_OFFSET) as *mut AtomicUsize;
-        prev_counter = (*cnt_ptr).fetch_sub(1, Ordering::SeqCst);
-    }
-    debug_assert!(prev_counter > 0);
-}
-
-/// Returns true if preemption is currently disabled. (without switching gs bases)
-#[inline(always)]
-pub fn preempt_is_disabled() -> bool {
-    let base: *const u8 = cls_ptr().cast();
-    unsafe {
-        let cnt_ptr = base.add(PREEMPT_COUNT_OFFSET) as *const AtomicUsize;
-        (*cnt_ptr).load(Ordering::SeqCst) != 0
+fn enable_migration() {
+    if let Some(t) = unsafe { cls_ptr().as_ref_unchecked() }.scheduler.try_current_thread() {
+        t.decr_cls_ref();
     }
 }
 
@@ -327,6 +310,7 @@ pub fn scheduler_start() {
 }
 
 /// Function for debugging cls specific information
+#[allow(dead_code)]
 fn debug_cls() {
 
     let cls = cls();

@@ -47,7 +47,7 @@ use thingbuf::mpsc::{Sender};
 use crate::device::apic::get_apic_id;
 use crate::device::cpu::{disable_int_nested, enable_int_nested};
 use crate::ipi::send_fixed_to_apic;
-use crate::process::core_local_storage::{cls, current_core_id, preempt_is_disabled, scheduler, tss_static};
+use crate::process::core_local_storage::{cls, current_core_id, scheduler, tss_static};
 
 // thread IDs
 pub static THREAD_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -204,7 +204,7 @@ impl Scheduler {
             .expect("Trying to access current thread before initialization!")
     }
 
-    /// Return the current running thread or None if not init yet
+    /// Return reference to current thread, if possible.
     pub fn try_current_thread(&self) -> Option<Arc<Thread>> {
         self.current_thread
             .get_cloned()
@@ -656,17 +656,9 @@ impl Scheduler {
 
     /// Switch from current to next thread (from ready queue). \
     /// If `interrupt` is true, the function is called from an ISR and will send EOI to APIC otherwise not.
-    /// Returns without doing anything if preemption is disabled.
     fn switch_thread(&self, interrupt: bool) {
         if let Some(mut state) = self.ready_state.try_lock() {
             if !state.initialized {
-                if interrupt { apic().end_of_interrupt(); }
-                return;
-            }
-
-            // If preempt_is_disabled() is true, we are in an interrupt handler,
-            // and we should not switch threads to protect core safety.
-            if preempt_is_disabled() {
                 if interrupt { apic().end_of_interrupt(); }
                 return;
             }
@@ -782,8 +774,17 @@ impl Scheduler {
                 let amount = ((own_load-target_load)/4)+1;
                 for _ in 0..amount {
                     // Move one thread from the tail to the target
-                    let thread_opt = self.pop_last(state);
+                    let thread_opt = state.ready_queue.pop_front();
                     if let Some(thread) = thread_opt {
+                        // If we can't migrate this thread, skip it.
+                        // This makes us migrate one less thread than we wanted,
+                        // but this should be okay in general.
+                        if !thread.can_migrate() {
+                            info!("cannot migrate {thread:?}, skipping");
+                            state.ready_queue.push_back(thread);
+                            continue;
+                        }
+
                         // Check if the migrating thread is the last thread on this core that has used the FPU.
                         // If so, we need to reset `last_fpu_thread` to None.
                         // We do not need to store the FPU context of the migrating thread,
@@ -849,10 +850,7 @@ impl Scheduler {
         }
     }
 
-    /// Pops the last inserted thread from the ready queue.
-    fn pop_last(&self, state: &mut ReadyState) -> Option<Arc<Thread>> {
-        state.ready_queue.pop_front()
-    }
+    
 
     /// Check the sleep list for threads that need to be woken up
     fn check_sleep_list(state: &mut ReadyState, sleep_list: &mut Vec<(Arc<Thread>, usize)>) {
