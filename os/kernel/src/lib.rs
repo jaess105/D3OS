@@ -9,6 +9,7 @@
 */
 #![feature(allocator_api)]
 #![feature(abi_x86_interrupt)]
+#![feature(cell_get_cloned)]
 #![feature(map_try_insert)]
 #![no_std]
 
