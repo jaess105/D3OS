@@ -1,5 +1,4 @@
 use alloc::boxed::Box;
-use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 use core::ptr;
 use log::info;
@@ -120,54 +119,41 @@ fn cls_ptr() -> *mut CoreLocalStorage {
     //// Guard and accessors ////
 
 /// Preemption Guard
-pub struct ClsGuard<R> {
-    _guard: MigrationGuard,
-    r: R,
+pub struct ClsGuard<R: AsRef<CoreLocalStorage>> {
+    cls: R,
 }
 
-impl<R> ClsGuard<R> {
-    fn new(r: R) -> Self {
-        let _guard = MigrationGuard::new();
-        Self { _guard, r }
+impl<R: AsRef<CoreLocalStorage>> ClsGuard<R> {
+    fn new(cls: R) -> Self {
+        // disable migration
+        if let Some(t) = cls.as_ref().scheduler.try_current_thread() {
+            t.incr_cls_ref();
+        }
+        Self { cls }
     }
 }
 
-impl<'a> Deref for ClsGuard<&'a CoreLocalStorage> {
-    type Target = CoreLocalStorage;
-    fn deref(&self) -> &CoreLocalStorage { self.r }
-}
-
-impl<'a> Deref for ClsGuard<&'a mut CoreLocalStorage> {
-    type Target = CoreLocalStorage;
-    fn deref(&self) -> &CoreLocalStorage { self.r }
-}
-
-impl<'a> DerefMut for ClsGuard<&'a mut CoreLocalStorage> {
-    fn deref_mut(&mut self) -> &mut CoreLocalStorage { self.r }
-}
-
-/// Map a mutable CLS guard into a guard of one of its fields. (for future work)
-impl<'a> ClsGuard<&'a CoreLocalStorage> {
-    #[inline(always)]
-    pub fn map_ref<T>(self, f: impl FnOnce(& CoreLocalStorage) -> & T) -> ClsGuard<&'a  T> {
-        // Prevent `self` from being dropped (moving preempt out manually).
-        let me = ManuallyDrop::new(self);
-
-        // Move the guard out (no drop of the old guard).
-        let guard = unsafe { ptr::read(&me._guard) };
-        // Getting the field reference.
-        let sub: &T = f(me.r);
-
-        // Building the new guard (keeping preemption disabled).
-        ClsGuard { _guard: guard, r: sub }
+impl<R: AsRef<CoreLocalStorage>> Drop for ClsGuard<R> {
+    fn drop(&mut self) {
+        // re-enable migration
+        if let Some(t) = self.cls.as_ref().scheduler.try_current_thread() {
+            t.decr_cls_ref();
+        }
     }
 }
-/*
-pub type SchedulerRefGuard<'a> = ClsGuard<&'a Scheduler>;
-#[inline(always)]     // sleep() needs to be modified for this to work
-pub fn scheduler() -> SchedulerRefGuard<'static> {
-    cls().map_ref(|c| &c.scheduler)
-}*/
+
+impl<'a, R: AsRef<CoreLocalStorage>> Deref for ClsGuard<R> {
+    type Target = CoreLocalStorage;
+    fn deref(&self) -> &CoreLocalStorage { self.cls.as_ref() }
+}
+
+impl<'a> DerefMut for ClsGuard<&mut CoreLocalStorage> {
+    fn deref_mut(&mut self) -> &mut CoreLocalStorage { self.cls }
+}
+
+impl AsRef<CoreLocalStorage> for CoreLocalStorage {
+    fn as_ref(&self) -> &CoreLocalStorage { self }
+}
 
 /// CLS getter with guard.
 pub fn cls() -> ClsGuard<&'static CoreLocalStorage> {
@@ -179,33 +165,6 @@ pub fn cls() -> ClsGuard<&'static CoreLocalStorage> {
 pub fn cls_mut() -> ClsGuard<&'static mut CoreLocalStorage> {
     let r = unsafe { &mut *cls_ptr() };
     ClsGuard::new(r)
-}
-
-pub struct MigrationGuard { /* !Send, !Sync; holds pinned state */ }
-impl Drop for MigrationGuard {
-    #[inline(always)]
-    fn drop(&mut self) { enable_migration(); }
-}
-
-impl MigrationGuard {
-    #[inline(always)]
-    pub fn new() -> Self { disable_migration(); Self{} }
-}
-
-/// Disables thread migration temporarily.
-#[inline(always)]
-fn disable_migration() {
-    if let Some(t) = unsafe { cls_ptr().as_ref_unchecked() }.scheduler.try_current_thread() {
-        t.incr_cls_ref();
-    }
-}
-
-/// Enables thread migration temporarily.
-#[inline(always)]
-fn enable_migration() {
-    if let Some(t) = unsafe { cls_ptr().as_ref_unchecked() }.scheduler.try_current_thread() {
-        t.decr_cls_ref();
-    }
 }
 
     //// Everything about the fields of the CLS ////
