@@ -1,7 +1,7 @@
 use crate::interrupt::interrupt_dispatcher::InterruptVector;
 use crate::interrupt::interrupt_handler::InterruptHandler;
 use crate::memory::vma::VmaType;
-use crate::process::core_local_storage::{cls, cls_mut, current_core_id, local_apic_static, scheduler};
+use crate::process::core_local_storage::{cls, current_core_id, local_apic_static, scheduler};
 use crate::{acpi_tables, allocator, apic, interrupt_dispatcher, process_manager, timer};
 use acpi::InterruptModel;
 use acpi::madt::Madt;
@@ -266,7 +266,7 @@ impl Apic {
         }
 
         // Initialization is finished -> Enable Local Apic
-        cls_mut().init_apic(true);
+        cls().init_apic(true);
         let mut bp_local_apic = local_apic_static().expect("local APIC not initialized").lock();
         // Initialization is finished -> Enable Local Apic
         unsafe {
@@ -279,7 +279,7 @@ impl Apic {
 
         // Calibrate APIC timer
         let timer_ticks_per_ms = Apic::calibrate_timer(&mut *bp_local_apic);
-        cls_mut().set_timer_ticks_per_ms(timer_ticks_per_ms);
+        cls().set_timer_ticks_per_ms(timer_ticks_per_ms);
 
         Self {
             io_apics,
@@ -313,11 +313,11 @@ impl Apic {
         // let timer_ticks_per_ms = Apic::calibrate_timer(&mut local_apic.lock());
         let timer_ticks_per_ms = apic().timer_ticks_per_ms;
         info!("   APIC Timer ticks per millisecond: [{timer_ticks_per_ms}]");
-        cls_mut().set_timer_ticks_per_ms(timer_ticks_per_ms);
+        cls().set_timer_ticks_per_ms(timer_ticks_per_ms);
     }
 
-    /// Creates a new local APIC instance and wraps it in a Mutex.
-    pub fn new_local_apic(is_bp: bool) -> Mutex<LocalApic> {
+    /// Creates a new local APIC instance.
+    pub fn new_local_apic(is_bp: bool) -> LocalApic {
         // Find APIC relevant structures in ACPI tables
         let madt_mapping = acpi_tables()
             .lock()
@@ -326,8 +326,7 @@ impl Apic {
         let madt = madt_mapping.get();
 
         // Create Local APIC instance
-        let local_apic = Mutex::new(Self::create_local_apic(&madt, is_bp));
-        local_apic
+        Self::create_local_apic(&madt, is_bp)
     }
 
     /// Creates a new local APIC instance.

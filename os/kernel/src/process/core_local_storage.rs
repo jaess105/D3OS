@@ -1,9 +1,11 @@
 use alloc::boxed::Box;
-use core::ops::{Deref, DerefMut};
+use core::mem::offset_of;
+use core::ops::Deref;
 use core::ptr;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use log::info;
 use raw_cpuid::CpuId;
-use spin::{Mutex};
+use spin::{Mutex, Once};
 use thingbuf::mpsc::errors::TryRecvError;
 use thingbuf::mpsc::Receiver;
 use x2apic::lapic::LocalApic;
@@ -30,8 +32,8 @@ pub struct CoreLocalStorage {
     tss_rsp0_ptr: VirtAddr,
     user_rsp: VirtAddr,
     id: u32,
-    local_apic: Option<Mutex<LocalApic>>,
-    timer_ticks_per_ms: usize,  // currently unused => needs new calibration method
+    local_apic: Once<Mutex<LocalApic>>,
+    timer_ticks_per_ms: AtomicUsize,  // currently unused => needs new calibration method
     tss: Mutex<TaskStateSegment>,
     gdt: Mutex<GlobalDescriptorTable>,
     scheduler: Scheduler,
@@ -45,8 +47,8 @@ impl CoreLocalStorage {
             tss_rsp0_ptr: VirtAddr::zero(),
             user_rsp: VirtAddr::zero(),
             id,
-            local_apic: None,
-            timer_ticks_per_ms: 0,
+            local_apic: Once::new(),
+            timer_ticks_per_ms: AtomicUsize::default(),
             tss: Mutex::new(TaskStateSegment::new()),
             gdt: Mutex::new(GlobalDescriptorTable::new()),
             scheduler: Scheduler::new(),
@@ -57,12 +59,12 @@ impl CoreLocalStorage {
     /// Returns a reference to the local_apic of this core.
     #[inline(always)]
     pub fn local_apic(&self) -> &Mutex<LocalApic> {
-        &self.local_apic.as_ref().expect("Local Apic not initialized")
+        &self.local_apic.get().expect("Local Apic not initialized")
     }
 
-    pub fn init_apic(&mut self, is_bp: bool) {
+    pub fn init_apic(&self, is_bp: bool) {
         assert_eq!(is_bp, self.id == 0);
-        self.local_apic = Some(Apic::new_local_apic(is_bp));
+        self.local_apic.call_once(|| Mutex::new(Apic::new_local_apic(is_bp)));
     }
 
     /// Tries to receive a MessageItem from the inbox.
@@ -72,14 +74,14 @@ impl CoreLocalStorage {
 
     /// Sets the timer ticks per ms that will be used for the timer interrupt in the future.
     /// (needs to be fixed)
-    pub fn set_timer_ticks_per_ms(&mut self, ticks: usize) {
+    pub fn set_timer_ticks_per_ms(&self, ticks: usize) {
         assert_ne!(ticks, 0);
-        self.timer_ticks_per_ms = ticks;
+        self.timer_ticks_per_ms.store(ticks, Ordering::SeqCst);
     }
 
     /// Returns the timer ticks per ms that will be used for the timer interrupt.
     pub fn timer_ticks_per_ms(&self) -> usize {
-        self.timer_ticks_per_ms
+        self.timer_ticks_per_ms.load(Ordering::SeqCst)
     }
 }
 
@@ -118,52 +120,41 @@ fn cls_ptr() -> *mut CoreLocalStorage {
 
     //// Guard and accessors ////
 
-/// Preemption Guard
-pub struct ClsGuard<R: AsRef<CoreLocalStorage>> {
-    cls: R,
+/// Guard for the [`CoreLocalStorage`]
+/// 
+/// If a thread holds a reference to the core-local storage,
+/// it can't be migrated to a different core.
+pub struct ClsGuard {
+    cls: &'static CoreLocalStorage,
 }
 
-impl<R: AsRef<CoreLocalStorage>> ClsGuard<R> {
-    fn new(cls: R) -> Self {
+impl ClsGuard {
+    fn new(cls: &'static CoreLocalStorage) -> Self {
         // disable migration
-        if let Some(t) = cls.as_ref().scheduler.try_current_thread() {
+        if let Some(t) = cls.scheduler.try_current_thread() {
             t.incr_cls_ref();
         }
         Self { cls }
     }
 }
 
-impl<R: AsRef<CoreLocalStorage>> Drop for ClsGuard<R> {
+impl Drop for ClsGuard {
     fn drop(&mut self) {
         // re-enable migration
-        if let Some(t) = self.cls.as_ref().scheduler.try_current_thread() {
+        if let Some(t) = self.cls.scheduler.try_current_thread() {
             t.decr_cls_ref();
         }
     }
 }
 
-impl<'a, R: AsRef<CoreLocalStorage>> Deref for ClsGuard<R> {
+impl Deref for ClsGuard {
     type Target = CoreLocalStorage;
-    fn deref(&self) -> &CoreLocalStorage { self.cls.as_ref() }
-}
-
-impl<'a> DerefMut for ClsGuard<&mut CoreLocalStorage> {
-    fn deref_mut(&mut self) -> &mut CoreLocalStorage { self.cls }
-}
-
-impl AsRef<CoreLocalStorage> for CoreLocalStorage {
-    fn as_ref(&self) -> &CoreLocalStorage { self }
+    fn deref(&self) -> &CoreLocalStorage { &self.cls }
 }
 
 /// CLS getter with guard.
-pub fn cls() -> ClsGuard<&'static CoreLocalStorage> {
+pub fn cls() -> ClsGuard {
     let r = unsafe { & *cls_ptr() };
-    ClsGuard::new(r)
-}
-
-/// mut CLS getter with guard.
-pub fn cls_mut() -> ClsGuard<&'static mut CoreLocalStorage> {
-    let r = unsafe { &mut *cls_ptr() };
     ClsGuard::new(r)
 }
 
@@ -175,8 +166,9 @@ pub fn current_core_id() -> u32 {
     let id: u32;
     unsafe {
         core::arch::asm!(
-        "mov {tmp:e}, gs:[24]",    //id is after 3 pointers (3*8 bytes)
+        "mov {tmp:e}, gs:[{offset}]",
         tmp = out(reg) id,
+        offset = const offset_of!(CoreLocalStorage, id),
         options(nostack, preserves_flags, readonly)
         );
     }
@@ -186,7 +178,7 @@ pub fn current_core_id() -> u32 {
 /// Returns the APIC of this core.
 #[inline(always)]
 pub fn local_apic_static() -> Option<&'static Mutex<LocalApic>> {
-    unsafe { (*cls_ptr()).local_apic.as_ref() }
+    unsafe { (*cls_ptr()).local_apic.get() }
 }
 
 /// Returns the Task State Segment of this core.
@@ -203,7 +195,7 @@ pub fn tss_static() -> &'static Mutex<TaskStateSegment> {
 pub fn init_tss_cls() {
     let tss_rsp0_ptr =
         VirtAddr::new(ptr::from_ref(tss_static().lock().deref()) as u64 + size_of::<u32>() as u64);
-    cls_mut().tss_rsp0_ptr = tss_rsp0_ptr;
+    unsafe { &mut *cls_ptr() }.tss_rsp0_ptr = tss_rsp0_ptr;
 }
 
 /// Returns the Global Descriptor Table of this core.
@@ -276,7 +268,7 @@ fn debug_cls() {
     let tss_rsp0 = cls.tss_rsp0_ptr;
     let user_rsp = cls.user_rsp;
     let id = cls.id;
-    let timer_ticks_per_ms = cls.timer_ticks_per_ms;
+    let timer_ticks_per_ms = cls.timer_ticks_per_ms.load(Ordering::SeqCst);
 
     if let Some(feat) = CpuId::new().get_feature_info() {
         let has_tsc = feat.has_tsc();
