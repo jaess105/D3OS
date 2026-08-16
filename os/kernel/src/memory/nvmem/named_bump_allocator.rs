@@ -1,8 +1,13 @@
 use crate::memory::nvmem::named_bump_allocator::{
     alloc_name::{Name, make_name},
+    pool::Pool,
     results::NvmemAllocResult,
 };
-use core::{fmt, sync::atomic::AtomicBool};
+use core::fmt;
+
+pub unsafe fn init(base: *mut u8, len: u64) -> NamedBumpAllocator {
+    NamedBumpAllocator::new(Pool::new(base, len))
+}
 
 pub struct NamedBumpAllocator {
     inner: allocation::NamedAllocator,
@@ -18,7 +23,7 @@ impl NamedBumpAllocator {
     /// Always overwrites the stored value for `name` (allocates on first
     /// use). Errors if the name already exists under a different size —
     /// this bump allocator can't resize a block in place.
-    pub fn clean_alloc<T: Copy + fmt::Debug>(&self, name: Name, element: T) -> NvmemAllocResult<T> {
+    pub fn alloc<T: Copy + fmt::Debug>(&self, name: Name, element: T) -> NvmemAllocResult<T> {
         let size = core::mem::size_of::<T>() as u64;
         let offset = match self.inner.lookup(&name) {
             Some(existing) => {
@@ -35,15 +40,22 @@ impl NamedBumpAllocator {
 
     /// Returns the existing value for `name` if present, otherwise
     /// allocates and stores `element`.
-    pub fn alloc_or_get<T: Copy + fmt::Debug>(&self, name: Name, element: T) -> NvmemAllocResult<T> {
-        let size = core::mem::size_of::<T>() as u64;
-        if let Some(offset) = self.inner.lookup(&name) {
-            let ptr = self.inner.pool().offset_to_ptr(offset) as *const T;
-            return Ok(unsafe { ptr.read() });
+    pub fn get_or_alloc<T: Copy + fmt::Debug>(&self, name: Name, element: T) -> NvmemAllocResult<T> {
+        if let Some(element) = self.get::<T>(name) {
+            return Ok(element);
         }
+
+        let size = core::mem::size_of::<T>() as u64;
         let offset = self.inner.alloc(&name, size)?;
         self.write_value(offset, size, element);
         Ok(element)
+    }
+
+    pub fn get<T: Copy + fmt::Debug>(&self, name: Name) -> Option<T> {
+        self.inner.lookup(&name).map(|offset| {
+            let ptr = self.inner.pool().offset_to_ptr(offset) as *const T;
+            unsafe { ptr.read() }
+        })
     }
 
     fn write_value<T: Copy>(&self, offset: u64, size: u64, element: T) {
@@ -74,6 +86,10 @@ mod pool {
             self.len
         }
 
+        pub fn start(&self) -> u64 {
+            self.base as u64
+        }
+
         pub fn offset_to_ptr(&self, offset: u64) -> *mut u8 {
             (self.base as u64 + offset) as *mut u8
         }
@@ -94,6 +110,8 @@ mod pool {
 }
 
 mod allocation {
+    use log::info;
+
     use crate::memory::nvmem::named_bump_allocator::{
         alloc_name::Name,
         block_header::BlockHeader,
@@ -153,7 +171,20 @@ mod allocation {
             let new_header_offset = self.pool.data_offset(last_offset) + last_header.size();
 
             let header_size = size_of::<BlockHeader>() as u64;
+            let new_full_size = new_header_offset + header_size + size;
             if new_header_offset + header_size + size > self.pool.len() {
+                info!(
+                    "NVMEM:
+                    pool_start: {},
+                new_header_offset: {}, header_size: {}, size: {},
+                new full size: {}; greater than pool len: {}",
+                    self.pool.start(),
+                    new_header_offset,
+                    header_size,
+                    size,
+                    new_full_size,
+                    self.pool.len()
+                );
                 return Err(NvmemError::OutOfSpace);
             }
 
@@ -277,16 +308,71 @@ mod block_header {
 }
 
 mod flush {
+    //! Cache-line writeback + fence primitives for making writes durable
+    //! on NVRAM. x86_64 only.
+    //!
+    //! Instruction choice, in preference order: `clwb` (writes back without
+    //! evicting — cheapest for metadata we're about to re-read) > `clflushopt`
+    //! (writes back + evicts, still weakly ordered) > `clflush` (universally
+    //! available, but ordered only against itself/same-address stores — used
+    //! only as a last-resort fallback). Which one compiles in is decided at
+    //! build time via target-feature cfg flags (set with e.g.
+    //! `-C target-feature=+clwb` in your kernel's build config, or by
+    //! targeting a `-target-cpu` that implies it). There is no runtime
+    //! CPUID check here — if you need to support hardware you don't know
+    //! about at build time, that's the place to add one, dispatching to
+    //! one of the three fns below based on a CPUID feature bit read once
+    //! at boot and cached, rather than branching on every flush call.
+    //!
+    //! `clwb`/`clflushopt` are unordered with respect to other stores and
+    //! with each other, which is exactly why every write path in this
+    //! allocator calls `persist_range` (flush every touched line, then a
+    //! single `sfence`) rather than trusting the flush alone.
+
+    use core::arch::asm;
+
     const CACHE_LINE: u64 = 64;
 
-    fn flush(ptr: *const u8) { /* clwb or clflushopt */
+    #[cfg(target_feature = "clwb")]
+    #[inline(always)]
+    fn flush(ptr: *const u8) {
+        unsafe {
+            asm!("clwb byte ptr [{0}]", in(reg) ptr, options(nostack, preserves_flags));
+        }
     }
-    fn fence() { /* sfence */
+
+    #[cfg(all(not(target_feature = "clwb"), target_feature = "clflushopt"))]
+    #[inline(always)]
+    fn flush(ptr: *const u8) {
+        unsafe {
+            asm!("clflushopt byte ptr [{0}]", in(reg) ptr, options(nostack, preserves_flags));
+        }
+    }
+
+    #[cfg(all(not(target_feature = "clwb"), not(target_feature = "clflushopt")))]
+    #[inline(always)]
+    fn flush(ptr: *const u8) {
+        unsafe {
+            asm!("clflush byte ptr [{0}]", in(reg) ptr, options(nostack, preserves_flags));
+        }
+    }
+
+    #[inline(always)]
+    fn fence() {
+        // sfence orders stores (including the writebacks above) — a store
+        // fence is sufficient here since we're only ordering writes, not
+        // interleaving with loads that need to observe them in order.
+        unsafe {
+            asm!("sfence", options(nostack, preserves_flags));
+        }
     }
 
     /// Persist an arbitrary byte range, not just a single word — flushes
     /// every cache line the range touches, then fences once at the end
-    /// (one fence per range, not per line).
+    /// (one fence per range, not per line — sfence is not cheap, and
+    /// since clwb/clflushopt are unordered w.r.t. each other anyway,
+    /// batching them behind a single trailing fence is both correct and
+    /// faster than fencing after every line).
     pub fn persist_range(start: *const u8, len: u64) {
         if len == 0 {
             return;
@@ -301,7 +387,7 @@ mod flush {
     }
 }
 
-mod alloc_name {
+pub mod alloc_name {
     const NAME_LEN: usize = 64;
     pub type Name = [u8; NAME_LEN];
 
