@@ -1,18 +1,27 @@
 use core::{
     alloc::Layout,
+    fmt,
     ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicUsize},
 };
 
-use alloc::alloc::{AllocError, Allocator};
-use goblin::elf64::reloc::R_OR1K_TLS_DTPMOD;
+use alloc::{
+    alloc::{AllocError, Allocator},
+    vec::Vec,
+};
 use linked_list_allocator::LockedHeap;
 use log::{info, warn};
 use x86_64::structures::paging::frame::PhysFrameRange;
 
 use crate::{
     acpi_tables, efi_services_available,
-    memory::{PAGE_SIZE, nvmem::Nfit},
+    memory::nvmem::{
+        Nfit,
+        named_bump_allocator::{
+            self, NamedBumpAllocator, NvmemError, NvmemResult, SuperblockBehavior,
+            alloc_name::{Name, make_name},
+        },
+    },
 };
 use uefi::runtime::Time;
 
@@ -51,93 +60,86 @@ pub fn original_demo() {
     }
 }
 
-static FREE_BYTES: AtomicUsize = AtomicUsize::new(0); // number of bytes currently in the pipe
-
-pub struct NmemAllocator {
-    heap: LockedHeap,
-    initialized: AtomicBool,
-}
-
-impl NmemAllocator {
-    pub const fn new() -> Self {
-        Self {
-            heap: LockedHeap::empty(),
-            initialized: AtomicBool::new(false),
-        }
-    }
-
-    pub unsafe fn init(&self, frames: &PhysFrameRange) {
-        todo!()
-    }
-
-    pub fn is_initialized(&self) -> bool {
-        self.initialized.load(core::sync::atomic::Ordering::SeqCst)
-    }
-
-    pub fn is_locked(&self) -> bool {
-        self.heap.is_locked()
-    }
-
-    pub fn fetch(&self) {
-        todo!()
-    }
-}
-
-unsafe impl Allocator for NmemAllocator {
-    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        todo!()
-    }
-
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        todo!()
-    }
-}
-
-struct NamedBumpAllocator {}
-
-struct Entry;
-
 /// As a demo for NVRAM support, we read the last boot time from NVRAM and write the current boot time to it
 pub fn allocator_demo() {
     match acpi_tables().lock().find_table::<Nfit>() {
         Ok(nfit) => {
             if let Some(range) = nfit.get_phys_addr_ranges().first() {
-                let frames = range.as_phys_frame_range();
+                let start = range.as_phys_frame_range().start.start_address().as_u64();
+                let end = {
+                    let end_frame = range.as_phys_frame_range().end;
+                    let end_start = end_frame.start_address();
+                    let end_size = end_frame.size();
+                    (end_start + end_size).as_u64()
+                };
+                let len = end - start;
 
-                let allocator = NmemAllocator::new();
-                if allocator.is_initialized() {
-                    warn!("Allocator was already initialized. This is unexpected!");
-                    panic!();
+                info!("NVMEM allocator start: {}; len: {}", start, len);
+                let allocator = unsafe { named_bump_allocator::init(start as *mut u8, len, SuperblockBehavior::Throw) };
+
+                const BOOT_TIME: Name = make_name(b"boot_time");
+
+                let dates_opt = allocator.get::<[Option<Time>; 5]>(BOOT_TIME);
+                if let Some(dates) = dates_opt {
+                    for (idx, date) in dates.iter().enumerate() {
+                        if let Some(date) = date {
+                            if date.is_valid().is_ok() {
+                                info!(
+                                    "Last {} boot time: [{:0>4}-{:0>2}-{:0>2} {:0>2}:{:0>2}:{:0>2}]",
+                                    idx,
+                                    date.year(),
+                                    date.month(),
+                                    date.day(),
+                                    date.hour(),
+                                    date.minute(),
+                                    date.second()
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    info!("Last boot time not found");
                 }
 
-                unsafe {
-                    allocator.init(&frames);
+                if efi_services_available() {
+                    if let Ok(time) = uefi::runtime::get_time() {
+                        let mut dates = dates_opt.unwrap_or([None; 5]);
+
+                        for idx in (1..5).rev() {
+                            dates[idx] = dates[idx - 1];
+                        }
+                        dates[0] = Some(time);
+
+                        match on_size_mismatch_retry(allocator, BOOT_TIME, dates) {
+                            Err(err) => {
+                                warn!("There was an error allocating the boot time! {}", err);
+                            }
+                            Ok(_) => {
+                                info!("Boot time stored!");
+                            }
+                        }
+                    } else {
+                        warn!("No boot time stored, could not get time!");
+                    }
+                } else {
+                    warn!("No boot time stored, efi services unavailable!");
                 }
-
-                //     // Read last boot time from NVRAM
-                //     let date = unsafe { start_addr.read() };
-                //     if date.is_valid().is_ok() {
-                //         info!(
-                //             "Last boot time: [{:0>4}-{:0>2}-{:0>2} {:0>2}:{:0>2}:{:0>2}]",
-                //             date.year(),
-                //             date.month(),
-                //             date.day(),
-                //             date.hour(),
-                //             date.minute(),
-                //             date.second()
-                //         );
-                //     }
-
-                //     // Write current boot time to NVRAM
-                //     if efi_services_available() {
-                //         if let Ok(time) = uefi::runtime::get_time() {
-                //             unsafe { start_addr.write(time) }
-                //         }
-                //     }
             }
         }
         Err(e) => {
             warn!("Error when trying to find nfit acpi table for nvmem demo. Error was {e:?}");
         }
+    }
+}
+
+fn on_size_mismatch_retry<T: Copy + fmt::Debug>(allocator: NamedBumpAllocator, name: Name, element: T) -> NvmemResult<T> {
+    let error = allocator.alloc(name, element);
+    match error {
+        Err(NvmemError::SizeMismatch) => {
+            info!("Size mismatch, retrying");
+            allocator.dealloc(name)?;
+            allocator.alloc(name, element)
+        }
+        other => other,
     }
 }
