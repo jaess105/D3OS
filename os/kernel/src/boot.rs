@@ -15,15 +15,14 @@ use crate::device::ps2::{Keyboard, Mouse};
 use crate::device::{cpu, virtio};
 use crate::device::serial::SerialPort;
 use crate::interrupt::interrupt_dispatcher;
-use crate::memory::nvmem::Nfit;
 use crate::memory::pages::page_table_index;
 use crate::memory::vma::VmaType;
 use crate::memory::{dram, nvmem, PAGE_SIZE};
 use crate::process::thread::Thread;
 use crate::syscall::{sys_vmem, syscall_dispatcher};
 use crate::{
-    acpi_tables, allocator, apic, gdt, get_initrd_frames,
-    efi_services_available, init_acpi_tables, init_apic, init_boot_info,
+    allocator, apic, gdt, get_initrd_frames,
+    init_acpi_tables, init_apic, init_boot_info,
     init_cpu_info, init_initrd, init_lfb, init_lfb_info, init_pci,
     init_serial_port, init_tty, keyboard, logger, mouse,
     process_manager, serial_port, timer, tss,
@@ -42,7 +41,6 @@ use log::{info, warn, LevelFilter};
 use multiboot2::{BootInformation, BootInformationHeader, EFIMemoryMapTag, MemoryAreaType, MemoryMapTag, TagHeader};
 use uefi::data_types::Handle;
 use uefi::mem::memory_map::MemoryMap;
-use uefi::runtime::Time;
 use uefi_raw::table::boot::MemoryType;
 use uefi_raw::table::system::SystemTable;
 use x86_64::PrivilegeLevel::Ring0;
@@ -98,7 +96,7 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
     let kernel_image_region = kernel_image_region();
     dram::insert_reserved(kernel_image_region);
     info!("kernel image region: [{:#x} - {:#x}], #frames: [{}]", 
-        kernel_image_region.start.start_address().as_u64(), 
+        kernel_image_region.start.start_address().as_u64(),
         kernel_image_region.end.start_address().as_u64(),
         kernel_image_region.len()
     );
@@ -106,7 +104,7 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
     let ap_boot_region = ap_boot_region();
     dram::insert_reserved(ap_boot_region);
     info!("AP boot region:      [{:#x} - {:#x}], #frames: [{}]", 
-        ap_boot_region.start.start_address().as_u64(), 
+        ap_boot_region.start.start_address().as_u64(),
         ap_boot_region.end.start_address().as_u64(),
         ap_boot_region.len()
     );
@@ -181,7 +179,7 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
     info!("Enabling SIMD and FSGSBASE instructions");
     cpu::enable_simd();
     cpu::enable_fsgsbase();
-  
+
     // Initialize CPU information
     init_cpu_info();
 
@@ -341,32 +339,7 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
     nvmem::init();
 
     // As a demo for NVRAM support, we read the last boot time from NVRAM and write the current boot time to it
-    if let Ok(nfit) = acpi_tables().lock().find_table::<Nfit>() {
-        if let Some(range) = nfit.get_phys_addr_ranges().first() {
-            let date_ptr = range.as_phys_frame_range().start.start_address().as_u64() as *mut Time;
-
-            // Read last boot time from NVRAM
-            let date = unsafe { date_ptr.read() };
-            if date.is_valid().is_ok() {
-                info!(
-                    "Last boot time: [{:0>4}-{:0>2}-{:0>2} {:0>2}:{:0>2}:{:0>2}]",
-                    date.year(),
-                    date.month(),
-                    date.day(),
-                    date.hour(),
-                    date.minute(),
-                    date.second()
-                );
-            }
-
-            // Write current boot time to NVRAM
-            if efi_services_available() {
-                if let Ok(time) = uefi::runtime::get_time() {
-                    unsafe { date_ptr.write(time) }
-                }
-            }
-        }
-    }
+    nvmem::allocator::demo();
 
     // Load initial ramdisk
     init_initrd(initrd_tag);

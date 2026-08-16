@@ -8,8 +8,8 @@
    ╚═════════════════════════════════════════════════════════════════════════╝
 */
 
-use crate::memory::vma::VmaType;
 use crate::memory::PAGE_SIZE;
+use crate::memory::vma::VmaType;
 use crate::{acpi_tables, process_manager};
 use acpi::AcpiTable;
 use acpi::sdt::{SdtHeader, Signature};
@@ -221,12 +221,11 @@ pub fn init() {
     if let Ok(nfit) = acpi_tables().lock().find_table::<Nfit>() {
         // Search NFIT table for non-volatile memory ranges
         for spa in nfit.get_phys_addr_ranges() {
-
             // Copy values to avoid unaligned access of packed struct fields
             let address = spa.base;
             let length = spa.length;
             info!("Found non-volatile memory (Address: [0x{:x}], Length: [{} MiB])", address, length / 1024 / 1024);
-            
+
             process.virtual_address_space.kernel_map_devm_identity(
                 address,
                 address + length,
@@ -234,6 +233,50 @@ pub fn init() {
                 VmaType::DeviceMemory,
                 "nvram",
             );
+        }
+    }
+}
+
+pub mod allocator {
+    use log::{info, warn};
+
+    use crate::{acpi_tables, efi_services_available, memory::nvmem::Nfit};
+    use uefi::runtime::Time;
+
+    pub struct NmemAllocator;
+
+    /// As a demo for NVRAM support, we read the last boot time from NVRAM and write the current boot time to it
+    pub fn demo() {
+        match acpi_tables().lock().find_table::<Nfit>() {
+            Ok(nfit) => {
+                if let Some(range) = nfit.get_phys_addr_ranges().first() {
+                    let date_ptr = range.as_phys_frame_range().start.start_address().as_u64() as *mut Time;
+
+                    // Read last boot time from NVRAM
+                    let date = unsafe { date_ptr.read() };
+                    if date.is_valid().is_ok() {
+                        info!(
+                            "Last boot time: [{:0>4}-{:0>2}-{:0>2} {:0>2}:{:0>2}:{:0>2}]",
+                            date.year(),
+                            date.month(),
+                            date.day(),
+                            date.hour(),
+                            date.minute(),
+                            date.second()
+                        );
+                    }
+
+                    // Write current boot time to NVRAM
+                    if efi_services_available() {
+                        if let Ok(time) = uefi::runtime::get_time() {
+                            unsafe { date_ptr.write(time) }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Error when trying to find nfit acpi table for nvmem demo. Error was {e:?}");
+            }
         }
     }
 }
