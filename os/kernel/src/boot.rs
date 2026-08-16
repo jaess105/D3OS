@@ -339,7 +339,7 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
     nvmem::init();
 
     // As a demo for NVRAM support, we read the last boot time from NVRAM and write the current boot time to it
-    nvmem::allocator::demo();
+    nvmem::allocator::original_demo();
 
     // Load initial ramdisk
     init_initrd(initrd_tag);
