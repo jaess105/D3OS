@@ -23,6 +23,7 @@ use x86_64::structures::paging::frame::PhysFrameRange;
 use x86_64::structures::paging::{PageTableFlags, PhysFrame};
 
 pub mod allocator;
+pub mod named_bump_allocator;
 
 #[allow(dead_code)]
 #[repr(u16)]
