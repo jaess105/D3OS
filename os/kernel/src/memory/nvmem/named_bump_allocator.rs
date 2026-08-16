@@ -5,8 +5,15 @@ use crate::memory::nvmem::named_bump_allocator::{
 };
 use core::fmt;
 
-pub unsafe fn init(base: *mut u8, len: u64) -> NamedBumpAllocator {
-    NamedBumpAllocator::new(Pool::new(base, len))
+pub use results::{NvmemError, NvmemResult};
+pub use superblock::SuperblockBehavior;
+
+/// Mounts (or formats, or ignores — see `SuperblockBehavior`) the pool at
+/// `base..base+len` and returns a ready-to-use allocator.
+pub unsafe fn init(base: *mut u8, len: u64, behavior: SuperblockBehavior) -> NamedBumpAllocator {
+    let pool = unsafe { Pool::new(base, len) };
+    superblock::mount(&pool, behavior);
+    NamedBumpAllocator::new(pool)
 }
 
 pub struct NamedBumpAllocator {
@@ -56,6 +63,10 @@ impl NamedBumpAllocator {
             let ptr = self.inner.pool().offset_to_ptr(offset) as *const T;
             unsafe { ptr.read() }
         })
+    }
+
+    pub fn dealloc(&self, name: Name) -> NvmemResult<()> {
+        self.inner.free(&name)
     }
 
     fn write_value<T: Copy>(&self, offset: u64, size: u64, element: T) {
@@ -109,6 +120,107 @@ mod pool {
     }
 }
 
+/// The fixed, always-findable pool prefix: a magic number + version. This
+/// is the one thing `mount` can check without trusting anything else in
+/// the pool — everything past it (the root block, the chain) is only
+/// trusted once this checks out.
+mod superblock {
+    use core::mem::size_of;
+
+    use crate::memory::nvmem::named_bump_allocator::{block_header::BlockHeader, flush::persist_range, pool::Pool};
+
+    pub const MAGIC: u64 = 0x4E564D454D5F4844; // "NVMEM_HD" as bytes, arbitrary but fixed
+    pub const VERSION: u32 = 1;
+
+    /// Block headers (the chain) start right after the superblock.
+    pub const ROOT_OFFSET: u64 = size_of::<Superblock>() as u64;
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    struct Superblock {
+        magic: u64,
+        version: u32,
+    }
+
+    /// What to do when the pool's magic/version don't match what this
+    /// allocator expects — e.g. first-ever boot (all zeros/garbage), a
+    /// pool written by an older/incompatible version, or genuine
+    /// corruption. There is no way to tell these apart from the magic
+    /// check alone, so the caller decides how to handle "don't know".
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SuperblockBehavior {
+        /// Wipe and reinitialize: write a fresh superblock and an empty
+        /// root block. Correct for first-ever boot; destroys any existing
+        /// data if this was actually a version mismatch or corruption.
+        Format,
+        /// Panic. Use when a mismatch should never happen in practice
+        /// (e.g. you control both the writer and reader version) and you
+        /// want to fail loudly rather than risk misinterpreting old data.
+        Throw,
+        /// Proceed as if the pool were valid, trusting whatever bytes are
+        /// already at `ROOT_OFFSET` onward. Dangerous — a genuinely
+        /// uninitialized or corrupt pool will produce garbage offsets
+        /// (this is the failure mode that motivated adding the check in
+        /// the first place). Only meaningful if you have some other way
+        /// to be sure the layout is actually compatible.
+        Ignore,
+    }
+
+    fn read(pool: &Pool) -> Superblock {
+        let ptr = pool.offset_to_ptr(0) as *const Superblock;
+        // Any bit pattern is a structurally valid Superblock (plain u64 +
+        // u32), so this read itself can't fail — it may just contain
+        // garbage, which is exactly what the magic/version check below
+        // is for.
+        unsafe { ptr.read() }
+    }
+
+    /// Writes a fresh superblock + empty root block, in the order that
+    /// keeps a crash mid-format safe: the root block goes first and is
+    /// persisted, and the magic/version — the single value that makes
+    /// the pool look valid to `mount` — is written and persisted last.
+    /// A crash before the final write leaves a pool that still reads as
+    /// "not yet formatted", never as "formatted but with a garbage root".
+    fn format(pool: &Pool) {
+        let root_ptr = pool.header_at(ROOT_OFFSET);
+        unsafe {
+            root_ptr.write(BlockHeader::new(b"root", 0));
+        }
+        persist_range(root_ptr as *const u8, size_of::<BlockHeader>() as u64);
+
+        let sb = Superblock {
+            magic: MAGIC,
+            version: VERSION,
+        };
+        let sb_ptr = pool.offset_to_ptr(0) as *mut Superblock;
+        unsafe {
+            sb_ptr.write(sb);
+        }
+        persist_range(sb_ptr as *const u8, size_of::<Superblock>() as u64);
+    }
+
+    /// Checks the pool's superblock and applies `behavior` on mismatch.
+    /// Must run before any other allocator operation touches the pool —
+    /// `alloc`/`lookup`/`walk_chain` all assume a valid root block already
+    /// exists at `ROOT_OFFSET`, which is only guaranteed once this has
+    /// either confirmed the existing one or formatted a new one.
+    pub fn mount(pool: &Pool, behavior: SuperblockBehavior) {
+        let sb = read(pool);
+        if sb.magic == MAGIC && sb.version == VERSION {
+            return;
+        }
+
+        match behavior {
+            SuperblockBehavior::Format => format(pool),
+            SuperblockBehavior::Throw => panic!("NVMEM superblock mismatch: expected magic {:#x} version {}, found {:#x?}", MAGIC, VERSION, sb),
+            SuperblockBehavior::Ignore => {
+                // Deliberately do nothing — proceed with whatever is at
+                // ROOT_OFFSET, valid or not. See the enum doc comment.
+            }
+        }
+    }
+}
+
 mod allocation {
     use log::info;
 
@@ -118,13 +230,12 @@ mod allocation {
         flush::persist_range,
         pool::Pool,
         results::{NvmemError, NvmemResult},
+        superblock::ROOT_OFFSET,
     };
     use core::{
         mem::size_of,
         sync::atomic::{AtomicBool, Ordering},
     };
-
-    const ROOT_OFFSET: u64 = 0;
 
     pub struct NamedAllocator {
         pool: Pool,
