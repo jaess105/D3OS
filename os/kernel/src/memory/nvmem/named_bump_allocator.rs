@@ -1,53 +1,62 @@
-use core::{fmt, sync::atomic::AtomicBool};
-
 use crate::memory::nvmem::named_bump_allocator::{
     alloc_name::{Name, make_name},
     results::NvmemAllocResult,
 };
-
-#[repr(C)]
-struct BlockHeader {
-    size: u64,          // size of this block's data region
-    next: Option<u64>,  // offset of next block, 0/sentinel if none
-    in_use: AtomicBool, // the atomic "commit" flag — see alloc.rs notes
-    name: Name,         // fixed-size, not necessarily NUL-terminated — track len separately or require NUL padding
-}
-
-impl BlockHeader {
-    fn empty(input: &[u8]) -> Self {
-        Self {
-            size: 0,
-            next: None,
-            in_use: AtomicBool::new(false),
-            name: make_name(input),
-        }
-    }
-}
+use core::{fmt, sync::atomic::AtomicBool};
 
 pub struct NamedBumpAllocator {
-    head: BlockHeader,
+    inner: allocation::NamedAllocator,
 }
 
 impl NamedBumpAllocator {
-    fn new() -> Self {
+    pub fn new(pool: pool::Pool) -> Self {
         Self {
-            head: BlockHeader::empty(b"root"),
+            inner: allocation::NamedAllocator::new(pool),
         }
     }
 
-    /// Always overrides the element with the given value
-    fn clean_alloc<T: fmt::Debug>(name: Name, element: T) -> NvmemAllocResult<T> {
-        todo!()
+    /// Always overwrites the stored value for `name` (allocates on first
+    /// use). Errors if the name already exists under a different size —
+    /// this bump allocator can't resize a block in place.
+    pub fn clean_alloc<T: Copy + fmt::Debug>(&self, name: Name, element: T) -> NvmemAllocResult<T> {
+        let size = core::mem::size_of::<T>() as u64;
+        let offset = match self.inner.lookup(&name) {
+            Some(existing) => {
+                if self.inner.stored_size(&name) != Some(size) {
+                    return Err(results::NvmemError::SizeMismatch);
+                }
+                existing
+            }
+            None => self.inner.alloc(&name, size)?,
+        };
+        self.write_value(offset, size, element);
+        Ok(element)
     }
 
-    /// Allocates memory for the struct and stores it in it or retrieves the value
-    fn alloc_or_get<T: fmt::Debug>(name: Name, element: T) -> NvmemAllocResult<T> {
-        todo!()
+    /// Returns the existing value for `name` if present, otherwise
+    /// allocates and stores `element`.
+    pub fn alloc_or_get<T: Copy + fmt::Debug>(&self, name: Name, element: T) -> NvmemAllocResult<T> {
+        let size = core::mem::size_of::<T>() as u64;
+        if let Some(offset) = self.inner.lookup(&name) {
+            let ptr = self.inner.pool().offset_to_ptr(offset) as *const T;
+            return Ok(unsafe { ptr.read() });
+        }
+        let offset = self.inner.alloc(&name, size)?;
+        self.write_value(offset, size, element);
+        Ok(element)
+    }
+
+    fn write_value<T: Copy>(&self, offset: u64, size: u64, element: T) {
+        let ptr = self.inner.pool().offset_to_ptr(offset) as *mut T;
+        unsafe { ptr.write(element) };
+        flush::persist_range(ptr as *const u8, size);
     }
 }
 
 mod pool {
-    use super::BlockHeader;
+    use core::mem::size_of;
+
+    use crate::memory::nvmem::named_bump_allocator::block_header::BlockHeader;
 
     pub struct Pool {
         base: *mut u8, // mapped base address of the NVRAM region (volatile, set at mount)
@@ -55,6 +64,16 @@ mod pool {
     }
 
     impl Pool {
+        /// Caller must guarantee `base..base+len` is a valid, mapped,
+        /// exclusively-owned NVRAM region for the lifetime of this `Pool`.
+        pub unsafe fn new(base: *mut u8, len: u64) -> Self {
+            Self { base, len }
+        }
+
+        pub fn len(&self) -> u64 {
+            self.len
+        }
+
         pub fn offset_to_ptr(&self, offset: u64) -> *mut u8 {
             (self.base as u64 + offset) as *mut u8
         }
@@ -66,57 +85,232 @@ mod pool {
         pub fn header_at(&self, offset: u64) -> *mut BlockHeader {
             self.offset_to_ptr(offset) as *mut BlockHeader
         }
+
+        /// Offset just past a block's header — where its data region starts.
+        pub fn data_offset(&self, header_offset: u64) -> u64 {
+            header_offset + size_of::<BlockHeader>() as u64
+        }
     }
 }
 
 mod allocation {
-    use crate::memory::nvmem::named_bump_allocator::{pool::Pool, results::NvmemResult};
+    use crate::memory::nvmem::named_bump_allocator::{
+        alloc_name::Name,
+        block_header::BlockHeader,
+        flush::persist_range,
+        pool::Pool,
+        results::{NvmemError, NvmemResult},
+    };
+    use core::{
+        mem::size_of,
+        sync::atomic::{AtomicBool, Ordering},
+    };
 
-    struct NamedAllocator {
+    const ROOT_OFFSET: u64 = 0;
+
+    pub struct NamedAllocator {
         pool: Pool,
     }
 
     impl NamedAllocator {
-        fn alloc(&self, name: &str, size: u64) -> NvmemResult<u64> {
-            todo!()
-        } // returns offset
-
-        fn free(&self, name: &str) -> NvmemResult<()> {
-            todo!()
+        pub fn new(pool: Pool) -> Self {
+            Self { pool }
         }
 
-        fn lookup(&self, name: &str) -> Option<u64> {
-            todo!()
+        pub fn pool(&self) -> &Pool {
+            &self.pool
         }
 
-        fn walk_chain(&self) -> impl Iterator<Item = u64> {
-            todo!()
-        } // yields block offsets
+        /// Internal: finds the *header* offset for a live (in_use) name.
+        fn find_header_offset(&self, name: &Name) -> Option<u64> {
+            self.walk_chain().find(|&offset| {
+                let header = unsafe { &*self.pool.header_at(offset) };
+                header.is_used() && header.name_is(&name)
+            })
+        }
+
+        /// Public lookup returns a *data* offset (past the header),
+        /// matching what `alloc` hands back — callers shouldn't need to
+        /// know header size.
+        pub fn lookup(&self, name: &Name) -> Option<u64> {
+            self.find_header_offset(name).map(|h| self.pool.data_offset(h))
+        }
+
+        pub fn stored_size(&self, name: &Name) -> Option<u64> {
+            self.find_header_offset(name).map(|h| unsafe { &*self.pool.header_at(h) }.size())
+        }
+
+        pub fn alloc(&self, name: &Name, size: u64) -> NvmemResult<u64> {
+            if self.lookup(name).is_some() {
+                return Err(NvmemError::DuplicateName);
+            }
+
+            // Bump allocator: always append after the current tail. No
+            // reuse of freed blocks, no coalescing — that's a deliberate
+            // simplification for now, not an oversight.
+            let last_offset = self.walk_chain().last().expect("chain always has at least the root block");
+            let last_header = unsafe { &*self.pool.header_at(last_offset) };
+            let new_header_offset = self.pool.data_offset(last_offset) + last_header.size();
+
+            let header_size = size_of::<BlockHeader>() as u64;
+            if new_header_offset + header_size + size > self.pool.len() {
+                return Err(NvmemError::OutOfSpace);
+            }
+
+            // Step 1: write the full new header at its offset, but leave
+            // it UNLINKED (the previous tail's `next` still doesn't point
+            // here). A crash here just looks like untouched free space.
+            let new_header_ptr = self.pool.header_at(new_header_offset);
+            unsafe {
+                new_header_ptr.write(BlockHeader::new(name, size));
+            }
+            persist_range(new_header_ptr as *const u8, header_size);
+
+            // Step 2: mark in_use. Still unreachable via walk_chain, so
+            // this is safe to do before linking.
+            unsafe { &*new_header_ptr }.set_used();
+            persist_range(new_header_ptr as *const u8, header_size);
+
+            // Step 3: the real commit — splice into the chain by updating
+            // the previous tail's `next`. This single write is what makes
+            // the new block reachable. If you crash before this lands,
+            // the new header is orphaned but harmless (never walked,
+            // never trusted, and its space just looks unused past the
+            // old tail).
+            let last_header_mut = unsafe { &mut *self.pool.header_at(last_offset) };
+            last_header_mut.set_next(new_header_offset);
+            persist_range(last_header_mut.next_start(), size_of::<Option<u64>>() as u64);
+
+            Ok(self.pool.data_offset(new_header_offset))
+        }
+
+        pub fn free(&self, name: &Name) -> NvmemResult<()> {
+            let header_offset = self.find_header_offset(name).ok_or(NvmemError::NotFound)?;
+            let header = unsafe { &*self.pool.header_at(header_offset) };
+            header.set_unused();
+            persist_range(header.in_use_start(), size_of::<AtomicBool>() as u64);
+            // Note: space is not reclaimed or reused — consistent with
+            // the bump-allocator model. A freed block just stops being
+            // visible to lookup().
+            Ok(())
+        }
+
+        pub fn walk_chain(&self) -> impl Iterator<Item = u64> + '_ {
+            let mut current = Some(ROOT_OFFSET);
+            core::iter::from_fn(move || {
+                let offset = current?;
+                let header = unsafe { &*self.pool.header_at(offset) };
+                current = header.next();
+                Some(offset)
+            })
+        }
+    }
+}
+
+mod block_header {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::memory::nvmem::named_bump_allocator::alloc_name::{Name, make_name};
+
+    #[repr(C)]
+    pub struct BlockHeader {
+        size: u64,          // size of this block's data region
+        next: Option<u64>,  // offset of next block, None if this is the tail
+        in_use: AtomicBool, // the atomic "commit" flag — see alloc() notes
+        name: Name,         // fixed-size, not NUL-terminated — compared as a full array
+    }
+
+    impl BlockHeader {
+        pub fn empty(input: &[u8]) -> Self {
+            Self::new(input, 0)
+        }
+
+        pub fn new(input: &[u8], size: u64) -> Self {
+            Self {
+                size,
+                next: None,
+                in_use: AtomicBool::new(false),
+                name: make_name(input),
+            }
+        }
+
+        pub fn in_use(&self) -> &AtomicBool {
+            &self.in_use
+        }
+
+        pub fn name_is(&self, name: &[u8; 64]) -> bool {
+            &self.name == name
+        }
+
+        pub fn size(&self) -> u64 {
+            self.size
+        }
+
+        pub fn set_used(&self) {
+            self.in_use.store(true, Ordering::Release)
+        }
+
+        pub fn is_used(&self) -> bool {
+            self.in_use.load(Ordering::Acquire)
+        }
+
+        pub fn set_next(&mut self, new_header_offset: u64) {
+            self.next = Some(new_header_offset)
+        }
+
+        pub fn set_unused(&self) {
+            self.in_use.store(false, Ordering::Release)
+        }
+
+        pub fn next_start(&mut self) -> *const u8 {
+            &self.next as *const Option<u64> as *const u8
+        }
+
+        pub fn next(&self) -> Option<u64> {
+            self.next
+        }
+
+        pub fn in_use_start(&self) -> *const u8 {
+            &self.in_use as *const AtomicBool as *const u8
+        }
     }
 }
 
 mod flush {
+    const CACHE_LINE: u64 = 64;
+
     fn flush(ptr: *const u8) { /* clwb or clflushopt */
     }
     fn fence() { /* sfence */
     }
-    fn persist(ptr: *const u8) {
-        flush(ptr);
+
+    /// Persist an arbitrary byte range, not just a single word — flushes
+    /// every cache line the range touches, then fences once at the end
+    /// (one fence per range, not per line).
+    pub fn persist_range(start: *const u8, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let mut addr = (start as u64) - (start as u64 % CACHE_LINE);
+        let end = start as u64 + len;
+        while addr < end {
+            flush(addr as *const u8);
+            addr += CACHE_LINE;
+        }
         fence();
     }
 }
 
 mod alloc_name {
     const NAME_LEN: usize = 64;
-
     pub type Name = [u8; NAME_LEN];
 
     /// Builds a `[u8; NAME_LEN]` from a byte-string literal, NUL-padded.
-    /// Panics at compile time if the input is longer than NAME_LEN.
+    /// Panics (at compile time, if used in a const context) if the input
+    /// is empty or longer than NAME_LEN.
     pub const fn make_name(input: &[u8]) -> Name {
         assert!(input.len() <= NAME_LEN, "name exceeds NAME_LEN");
         assert!(input.len() > 0, "name cannot be empty");
-
         let mut buf = [0u8; NAME_LEN];
         let mut i = 0;
         while i < input.len() {
@@ -128,30 +322,36 @@ mod alloc_name {
 }
 
 mod results {
+    use alloc::alloc::AllocError;
     use core::{error::Error, fmt};
 
-    use alloc::alloc::AllocError;
-
     pub type NvmemResult<T> = Result<T, NvmemError>;
+    pub type NvmemAllocResult<T> = Result<T, NvmemError>;
 
     #[derive(Debug)]
     pub enum NvmemError {
         Alloc(AllocError),
+        DuplicateName,
+        NotFound,
+        OutOfSpace,
+        SizeMismatch,
     }
 
     impl fmt::Display for NvmemError {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
                 NvmemError::Alloc(e) => write!(f, "allocation failed: {e:?}"),
+                NvmemError::DuplicateName => write!(f, "name already in use"),
+                NvmemError::NotFound => write!(f, "name not found"),
+                NvmemError::OutOfSpace => write!(f, "pool exhausted"),
+                NvmemError::SizeMismatch => write!(f, "name exists with a different size"),
             }
         }
     }
 
     impl Error for NvmemError {
         fn source(&self) -> Option<&(dyn Error + 'static)> {
-            match self {
-                NvmemError::Alloc(_) => None, // AllocError doesn't impl Error (see below)
-            }
+            None
         }
     }
 
